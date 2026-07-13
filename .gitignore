@@ -1,0 +1,13 @@
+# This repository intentionally publishes only the curated source files below.
+# Everything else in the working directory is local build output, caches,
+# legacy code, or machine-specific material.
+*
+
+!.gitignore
+!README.md
+!main.cpp
+!main.pro
+!bk_tree.h
+!copy-deps.ps1
+!package-portable.ps1
+!icon.png
