@@ -15,21 +15,6 @@ The self-contained Windows build is available from
 `DupeGem-portable.zip` and run `DupeGem.exe`; Qt and MSYS2 do not need to be
 installed on the destination computer.
 
-## Build from Notepad++
-
-This project intentionally keeps the qmake target named after `main.pro`, so the
-existing Notepad++ command remains valid:
-
-```text
-npp_save
-cd "$(CURRENT_DIRECTORY)"
-qmake6 "$(NAME_PART).pro"
-mingw32-make
-cmd /k "release\$(NAME_PART).exe"
-```
-
-When editing `main.cpp`, this builds and launches `release\main.exe`.
-
 ## Make a portable release
 
 After the release build succeeds, run:
