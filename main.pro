@@ -1,9 +1,11 @@
 QT += widgets concurrent sql
-SOURCES += main.cpp
-HEADERS += bk_tree.h
+SOURCES += main.cpp image_decoder.cpp
+HEADERS += bk_tree.h image_decoder.h
 CONFIG += c++17
+CONFIG += link_pkgconfig
 CONFIG -= console
 CONFIG += windows
+PKGCONFIG += libheif libraw_r
 QMAKE_LFLAGS += -static-libstdc++ -static-libgcc
 
 CONFIG(debug, debug|release) {

@@ -17,8 +17,7 @@ installed on the destination computer.
 
 ## Supported image formats
 
-The current portable build reports these formats through Qt's
-`QImageReader::supportedImageFormats()`:
+DupeGem combines Qt's image readers with dedicated libheif and LibRaw decoders:
 
 | Format | Extensions |
 | --- | --- |
@@ -33,9 +32,36 @@ The current portable build reports these formats through Qt's
 | Portable Pixmap | `.ppm` |
 | X Bitmap | `.xbm` |
 | X Pixmap | `.xpm` |
+| HEIC / HEIF | `.heic`, `.heif`, `.hif` |
+| Adobe Digital Negative | `.dng` |
+| Canon RAW | `.cr2`, `.cr3`, `.crw` |
+| Nikon RAW | `.nef`, `.nrw` |
+| Sony RAW | `.arw`, `.sr2`, `.srf` |
+| Fujifilm RAW | `.raf` |
+| Olympus / OM System RAW | `.orf` |
+| Panasonic / Leica RAW | `.raw`, `.rw2`, `.rwl` |
+| Pentax RAW | `.pef`, `.ptx` |
+| Samsung RAW | `.srw` |
+| Sigma RAW | `.x3f` |
+| Other LibRaw camera formats | `.3fr`, `.ari`, `.bay`, `.cap`, `.dcr`, `.dcs`, `.drf`, `.eip`, `.erf`, `.fff`, `.gpr`, `.iiq`, `.k25`, `.kdc`, `.mdc`, `.mef`, `.mos`, `.mrw`, `.pxn`, `.r3d`, `.rwz` |
 
-HEIC/HEIF and Canon RAW files (`.cr2` and `.cr3`) are **not currently
-supported** by the codecs bundled with the portable release.
+RAW hashing uses the camera's embedded preview when one is available. If a RAW
+file has no usable preview, DupeGem develops it with LibRaw. This fallback is
+limited to two concurrent images to prevent large RAW files from exhausting
+memory.
+
+## Build prerequisites
+
+Install Qt 6, libheif, and thread-safe LibRaw in the same MSYS2 MinGW64
+environment used by `qmake6`:
+
+```bash
+pacman -S --needed mingw-w64-x86_64-qt6-base mingw-w64-x86_64-libheif mingw-w64-x86_64-libraw
+```
+
+The existing Notepad++ build command remains unchanged. Run `qmake6 main.pro`
+again after installing the new libraries so qmake discovers them through
+`pkg-config`.
 
 ## Make a portable release
 
@@ -75,6 +101,12 @@ from the last checkpoint instead of recalculating those hashes.
 Similarity groups use representative matching: every member must match the
 group's first image at the selected threshold. This prevents long chains of
 indirectly similar images from collapsing into one misleading group.
+
+Exact MD5 mode includes a **Delete From All Groups** action for keeping one file
+from every byte-identical group and moving the rest to the Windows Recycle Bin.
+The keeper can be selected by newest or oldest modified time, filename order,
+or shortest/longest filename. Bulk deletion runs in the background and can be
+cancelled between files.
 
 The default decoder pool is capped at eight threads to prevent large or unusual
 images from multiplying peak memory usage. Override it when benchmarking a fast
