@@ -15,6 +15,28 @@ The self-contained Windows build is available from
 `DupeGem-portable.zip` and run `DupeGem.exe`; Qt and MSYS2 do not need to be
 installed on the destination computer.
 
+## Supported image formats
+
+The current portable build reports these formats through Qt's
+`QImageReader::supportedImageFormats()`:
+
+| Format | Extensions |
+| --- | --- |
+| Windows Bitmap | `.bmp` |
+| Windows Cursor | `.cur` |
+| GIF | `.gif` |
+| Windows Icon | `.ico` |
+| JPEG / JFIF | `.jfif`, `.jpeg`, `.jpg` |
+| Portable Bitmap | `.pbm` |
+| Portable Graymap | `.pgm` |
+| PNG | `.png` |
+| Portable Pixmap | `.ppm` |
+| X Bitmap | `.xbm` |
+| X Pixmap | `.xpm` |
+
+HEIC/HEIF and Canon RAW files (`.cr2` and `.cr3`) are **not currently
+supported** by the codecs bundled with the portable release.
+
 ## Make a portable release
 
 After the release build succeeds, run:
