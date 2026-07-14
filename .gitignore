@@ -7,6 +7,8 @@
 !README.md
 !main.cpp
 !main.pro
+!image_decoder.cpp
+!image_decoder.h
 !bk_tree.h
 !copy-deps.ps1
 !package-portable.ps1

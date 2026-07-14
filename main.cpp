@@ -56,6 +56,9 @@
 #include <QAbstractItemView>
 #include <QMenu>
 #include <QDesktopServices>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QSet>
 #include <QVector>
 #include <QtConcurrent>
 
@@ -76,6 +79,7 @@
 
 // Local
 #include "bk_tree.h"
+#include "image_decoder.h"
 
 namespace dg {
 
@@ -86,6 +90,7 @@ using BitHash = std::bitset<kHashBits>;
 
 // Added MD5 to the list
 enum class HashAlgo : int { DHash = 0, PHash, AHash, WHash, BHash, MD5, Count };
+enum class Md5KeepRule : int { Newest, Oldest, FilenameFirst, FilenameLast, ShortestName, LongestName };
 
 inline const char* algoName(HashAlgo a) {
     switch (a) {
@@ -403,14 +408,14 @@ inline int workerCount() {
 }
 
 inline bool readAndHash(ImgMeta& m, HashAlgo algo) {
-    QImageReader rd(m.file);
-    rd.setAutoTransform(true);
-    if (!rd.canRead()) return false;
-    if (!m.resolution.isValid()) m.resolution=rd.size();
-    if (algo==HashAlgo::MD5) return true;
-    if (m.resolution.width()>64 || m.resolution.height()>64) rd.setScaledSize(QSize(64,64));
-    QImage img=rd.read();
+    if (algo==HashAlgo::MD5) {
+        if (!m.resolution.isValid()) m.resolution=imageSourceSize(m.file);
+        return m.resolution.isValid();
+    }
+    QSize source;
+    QImage img=decodeImage(m.file,QSize(64,64),Qt::IgnoreAspectRatio,&source);
     if (img.isNull()) return false;
+    if (!m.resolution.isValid()) m.resolution=source;
     img.setColorSpace(QColorSpace());
     const QImage gray=img.convertToFormat(QImage::Format_Grayscale8);
     switch (algo) {
@@ -548,6 +553,12 @@ struct GroupResult {
     QString error;
     QString cacheWarning;
     HashAlgo algo=HashAlgo::DHash;
+    bool cancelled=false;
+};
+
+struct BulkDeleteResult {
+    QStringList deleted;
+    QStringList failed;
     bool cancelled=false;
 };
 
@@ -740,12 +751,7 @@ private:
             if (bigGif) { gifInfo_=QStringLiteral("Large GIF • animation disabled"); updateInfo(); }
         });
         watcher->setFuture(QtConcurrent::run([path,height]{
-            QImageReader r(path); r.setAutoTransform(true);
-            if (!r.canRead()) return QImage{};
-            const QSize orig=r.size();
-            const int width=(orig.isValid()&&orig.height()>0) ? qMax(1,qRound(double(orig.width())/orig.height()*height)) : height;
-            r.setScaledSize(QSize(width,height));
-            return r.read();
+            return decodeImage(path,QSize(0,height),Qt::KeepAspectRatio);
         }));
     }
     ImgMeta& meta_;
@@ -895,6 +901,10 @@ public:
     deleteVL->setContentsMargins(0, 8, 0, 4);
     deleteVL->setSpacing(0);
 
+    auto* deleteRow = new QHBoxLayout;
+    deleteRow->setContentsMargins(0, 0, 0, 0);
+    deleteRow->setSpacing(8);
+
     btnDelete_ = new QPushButton(QStringLiteral("Delete Selected"));
     btnDelete_->setObjectName(QStringLiteral("dangerButton"));
     btnDelete_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
@@ -908,7 +918,17 @@ public:
     // Double the button's height
     btnDelete_->setMinimumHeight(btnDelete_->sizeHint().height() * 1.2);
 
-    deleteVL->addWidget(btnDelete_);
+    btnDeleteAllGroups_ = new QPushButton(QStringLiteral("Delete From All Groups…"));
+    btnDeleteAllGroups_->setObjectName(QStringLiteral("secondaryDangerButton"));
+    btnDeleteAllGroups_->setToolTip(QStringLiteral(
+        "MD5 only: keep one file in every exact-match group and move the rest to the Recycle Bin."));
+    btnDeleteAllGroups_->setFont(df);
+    btnDeleteAllGroups_->setMinimumHeight(btnDelete_->minimumHeight());
+    btnDeleteAllGroups_->setVisible(false);
+
+    deleteRow->addWidget(btnDelete_, 1);
+    deleteRow->addWidget(btnDeleteAllGroups_, 1);
+    deleteVL->addLayout(deleteRow);
     ctl->addWidget(deleteWrap);
 }
 
@@ -1061,6 +1081,7 @@ connect(scBksp, &QShortcut::activated, this, [this]{
         connect(btnSelect_, &QPushButton::clicked, this, &DupeGemMainWindow::selectFolder);
         connect(btnRegroup_,&QPushButton::clicked, this, &DupeGemMainWindow::regroup);
         connect(btnDelete_, &QPushButton::clicked, this, &DupeGemMainWindow::deleteSelected);
+        connect(btnDeleteAllGroups_, &QPushButton::clicked, this, &DupeGemMainWindow::deleteAllMd5Duplicates);
         connect(btnCancel_,&QPushButton::clicked,this,[this]{ cancelled_=true; statusTxt_->setText(QStringLiteral("Cancelling safely…")); btnCancel_->setEnabled(false); });
 
         connect(groupsList_, &QListWidget::currentRowChanged, this, &DupeGemMainWindow::groupChosen);
@@ -1076,6 +1097,7 @@ connect(scBksp, &QShortcut::activated, this, [this]{
             const bool md5 = (static_cast<HashAlgo>(algoCombo_->currentIndex()) == HashAlgo::MD5);
             thrSlider_->setEnabled(!md5);
             thrLabel_->setEnabled(!md5);
+            btnDeleteAllGroups_->setVisible(md5);
             if(!images_.empty() && !busy_.load()) regroup();
         });
         connect(showSingles_, &QCheckBox::toggled, this, &DupeGemMainWindow::regroup);
@@ -1110,6 +1132,7 @@ connect(scBksp, &QShortcut::activated, this, [this]{
         cancelled_ = true;
         if (scanWatcher_) scanWatcher_->future().waitForFinished();
         if (groupWatcher_) groupWatcher_->future().waitForFinished();
+        if (bulkDeleteWatcher_) bulkDeleteWatcher_->future().waitForFinished();
     }
 protected:
     void closeEvent(QCloseEvent* ev) override {
@@ -1148,8 +1171,8 @@ private:
         statusTxt_->setText(QStringLiteral("Enumerating files..."));
 
         QStringList filters;
-        for (const QByteArray& fmt: QImageReader::supportedImageFormats()) {
-            filters << "*."+QString(fmt).toLower() << "*."+QString(fmt).toUpper();
+        for (const QString& extension: supportedImageExtensions()) {
+            filters << "*."+extension.toLower() << "*."+extension.toUpper();
         }
         filters.removeDuplicates();
         const bool recurse=scanSubs_->isChecked();
@@ -1445,17 +1468,243 @@ private:
         for (const QPointer<ThumbWidget>& t: currentThumbs_) if (t && t->isChecked()) t->unloadMovie();
         QCoreApplication::processEvents();
 
-        QStringList failed;
+        QStringList deleted, failed;
         for (const QString& f: toDelete) {
             if (QFile::moveToTrash(f)) {
-                for (auto& im: images_) if (im.file==f) { im.file.clear(); im.selected=false; break; }
+                deleted << f;
             } else failed << f;
         }
+        forgetDeletedFiles(deleted);
         if (!failed.isEmpty()) {
             QMessageBox::warning(this, QStringLiteral("Deletion Failed"),
                                  QStringLiteral("Could not delete:\n\n%1").arg(failed.join('\n')));
         }
         refreshAfterDelete();
+    }
+
+    void deleteAllMd5Duplicates() {
+        if (busy_.load()) return;
+        if (static_cast<HashAlgo>(algoCombo_->currentIndex()) != HashAlgo::MD5) {
+            QMessageBox::information(this, QStringLiteral("MD5 Required"),
+                                     QStringLiteral("This action is available only in Exact MD5 mode."));
+            return;
+        }
+
+        int eligibleGroups=0;
+        int deleteCount=0;
+        for (const auto& group:groups_) {
+            int valid=0;
+            for (int idx:group)
+                if (idx>=0 && idx<int(images_.size()) && !images_[size_t(idx)].file.isEmpty()) ++valid;
+            if (valid>1) { ++eligibleGroups; deleteCount+=valid-1; }
+        }
+        if (!eligibleGroups) {
+            QMessageBox::information(this, QStringLiteral("No Exact Duplicates"),
+                                     QStringLiteral("There are no MD5 groups containing more than one existing file."));
+            return;
+        }
+
+        QDialog dialog(this);
+        dialog.setWindowTitle(QStringLiteral("Keep One File Per MD5 Group"));
+        dialog.setMinimumWidth(540);
+        auto* layout=new QVBoxLayout(&dialog);
+        layout->setContentsMargins(20,18,20,18);
+        layout->setSpacing(12);
+        auto* summary=new QLabel(QStringLiteral(
+            "<b>%1 exact-match groups</b> contain %2 extra files.<br>"
+            "Choose which single file DupeGem should keep in every group.")
+            .arg(eligibleGroups).arg(deleteCount));
+        summary->setTextFormat(Qt::RichText);
+        summary->setWordWrap(true);
+        layout->addWidget(summary);
+
+        auto* rules=new QComboBox;
+        rules->addItem(QStringLiteral("Keep newest modified file"), int(Md5KeepRule::Newest));
+        rules->addItem(QStringLiteral("Keep oldest modified file"), int(Md5KeepRule::Oldest));
+        rules->addItem(QStringLiteral("Keep filename first (A–Z)"), int(Md5KeepRule::FilenameFirst));
+        rules->addItem(QStringLiteral("Keep filename last (Z–A)"), int(Md5KeepRule::FilenameLast));
+        rules->addItem(QStringLiteral("Keep shortest filename"), int(Md5KeepRule::ShortestName));
+        rules->addItem(QStringLiteral("Keep longest filename"), int(Md5KeepRule::LongestName));
+        layout->addWidget(rules);
+
+        auto* explanation=new QLabel;
+        explanation->setObjectName(QStringLiteral("infoCard"));
+        explanation->setWordWrap(true);
+        layout->addWidget(explanation);
+        auto updateExplanation=[rules,explanation]{
+            const auto rule=static_cast<Md5KeepRule>(rules->currentData().toInt());
+            QString text;
+            switch (rule) {
+                case Md5KeepRule::Newest: text=QStringLiteral("Uses each file's last-modified time. Alphabetical full path breaks ties."); break;
+                case Md5KeepRule::Oldest: text=QStringLiteral("Keeps the earliest last-modified file. Alphabetical full path breaks ties."); break;
+                case Md5KeepRule::FilenameFirst: text=QStringLiteral("Compares filenames case-insensitively from A to Z, then compares full paths."); break;
+                case Md5KeepRule::FilenameLast: text=QStringLiteral("Compares filenames case-insensitively from Z to A, then compares full paths."); break;
+                case Md5KeepRule::ShortestName: text=QStringLiteral("Keeps the shortest filename. Alphabetical filename and full path break ties."); break;
+                case Md5KeepRule::LongestName: text=QStringLiteral("Keeps the longest filename. Alphabetical filename and full path break ties."); break;
+            }
+            explanation->setText(text);
+        };
+        connect(rules,qOverload<int>(&QComboBox::currentIndexChanged),&dialog,[updateExplanation](int){updateExplanation();});
+        updateExplanation();
+
+        auto* buttons=new QDialogButtonBox(QDialogButtonBox::Ok|QDialogButtonBox::Cancel);
+        buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("Review Deletion"));
+        connect(buttons,&QDialogButtonBox::accepted,&dialog,&QDialog::accept);
+        connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
+        layout->addWidget(buttons);
+        if (dialog.exec()!=QDialog::Accepted) return;
+
+        const auto rule=static_cast<Md5KeepRule>(rules->currentData().toInt());
+        const QString ruleLabel=rules->currentText();
+        QStringList toDelete;
+        for (const auto& group:groups_) {
+            std::vector<int> valid;
+            valid.reserve(group.size());
+            for (int idx:group)
+                if (idx>=0 && idx<int(images_.size()) && !images_[size_t(idx)].file.isEmpty()) valid.push_back(idx);
+            if (valid.size()<2) continue;
+            const int keeper=chooseMd5Keeper(valid,rule);
+            for (int idx:valid) if (idx!=keeper) toDelete << images_[size_t(idx)].file;
+        }
+        if (toDelete.isEmpty()) return;
+
+        QMessageBox confirm(QMessageBox::Warning, QStringLiteral("Confirm Bulk Delete"),
+            QStringLiteral("Move %1 files from %2 exact-match groups to the Recycle Bin?")
+                .arg(toDelete.size()).arg(eligibleGroups),
+            QMessageBox::Yes|QMessageBox::Cancel, this);
+        confirm.setInformativeText(QStringLiteral("%1. Exactly one file will remain in every group.").arg(ruleLabel));
+        confirm.setDefaultButton(QMessageBox::Cancel);
+        if (confirm.exec()!=QMessageBox::Yes) return;
+        startBulkDelete(std::move(toDelete),eligibleGroups,ruleLabel);
+    }
+
+    int chooseMd5Keeper(const std::vector<int>& candidates, Md5KeepRule rule) const {
+        auto pathCompare=[this](int left,int right) {
+            return QString::compare(images_[size_t(left)].file,images_[size_t(right)].file,
+                                    Qt::CaseInsensitive);
+        };
+        auto nameOf=[this](int idx) { return QFileInfo(images_[size_t(idx)].file).fileName(); };
+        auto better=[&](int candidate,int current) {
+            const ImgMeta& a=images_[size_t(candidate)];
+            const ImgMeta& b=images_[size_t(current)];
+            const QString an=nameOf(candidate), bn=nameOf(current);
+            const int nameCmp=QString::compare(an,bn,Qt::CaseInsensitive);
+            switch (rule) {
+                case Md5KeepRule::Newest:
+                    if (a.mtime!=b.mtime) return a.mtime>b.mtime;
+                    break;
+                case Md5KeepRule::Oldest:
+                    if (a.mtime!=b.mtime) return a.mtime<b.mtime;
+                    break;
+                case Md5KeepRule::FilenameFirst:
+                    if (nameCmp!=0) return nameCmp<0;
+                    break;
+                case Md5KeepRule::FilenameLast:
+                    if (nameCmp!=0) return nameCmp>0;
+                    break;
+                case Md5KeepRule::ShortestName:
+                    if (an.size()!=bn.size()) return an.size()<bn.size();
+                    if (nameCmp!=0) return nameCmp<0;
+                    break;
+                case Md5KeepRule::LongestName:
+                    if (an.size()!=bn.size()) return an.size()>bn.size();
+                    if (nameCmp!=0) return nameCmp<0;
+                    break;
+            }
+            return pathCompare(candidate,current)<0;
+        };
+        int keeper=candidates.front();
+        for (size_t i=1;i<candidates.size();++i)
+            if (better(candidates[i],keeper)) keeper=candidates[i];
+        return keeper;
+    }
+
+    void forgetDeletedFiles(const QStringList& deleted) {
+        if (deleted.isEmpty()) return;
+        QSet<QString> paths;
+        paths.reserve(deleted.size());
+        for (const QString& path:deleted) paths.insert(path);
+        for (ImgMeta& image:images_) {
+            if (paths.contains(image.file)) { image.file.clear(); image.selected=false; }
+        }
+
+        SqliteCache cache(cacheFile_);
+        if (cache.isOpen()) {
+            const QDir root(currentDir_);
+            QStringList relative;
+            relative.reserve(deleted.size());
+            for (const QString& path:deleted) relative << root.relativeFilePath(path);
+            if (!cache.removePaths(relative))
+                statusTxt_->setText(QStringLiteral("Files deleted; cache cleanup will finish on the next scan."));
+        }
+    }
+
+    void startBulkDelete(QStringList toDelete, int groupCount, const QString& ruleLabel) {
+        clearThumbs();
+        QCoreApplication::processEvents();
+        busy_=true;
+        bulkDeleting_=true;
+        cancelled_=false;
+        setInteractive(false);
+        prog_->setVisible(true);
+        prog_->setRange(0,toDelete.size());
+        prog_->setValue(0);
+        statusTxt_->setText(QStringLiteral("Deleting exact duplicates… 0 / %1").arg(toDelete.size()));
+
+        QPointer<DupeGemMainWindow> self(this);
+        auto post=[self,total=toDelete.size()](int done) {
+            if (!self) return;
+            QMetaObject::invokeMethod(self,[self,done,total]{
+                if (!self || !self->bulkDeleting_.load()) return;
+                self->prog_->setValue(done);
+                self->statusTxt_->setText(QStringLiteral("Deleting exact duplicates… %1 / %2").arg(done).arg(total));
+            },Qt::QueuedConnection);
+        };
+
+        auto* watcher=new QFutureWatcher<BulkDeleteResult>(this);
+        bulkDeleteWatcher_=watcher;
+        connect(watcher,&QFutureWatcher<BulkDeleteResult>::finished,this,
+                [this,watcher,groupCount,ruleLabel]{
+            BulkDeleteResult result=watcher->future().takeResult();
+            watcher->deleteLater(); bulkDeleteWatcher_=nullptr; bulkDeleting_=false;
+            forgetDeletedFiles(result.deleted);
+            prog_->setVisible(false);
+            busy_=false;
+
+            if (!result.failed.isEmpty()) {
+                QStringList shown=result.failed.mid(0,12);
+                if (result.failed.size()>shown.size())
+                    shown << QStringLiteral("…and %1 more").arg(result.failed.size()-shown.size());
+                QMessageBox::warning(this,QStringLiteral("Some Files Could Not Be Deleted"),
+                    QStringLiteral("%1 file(s) could not be moved to the Recycle Bin:\n\n%2")
+                        .arg(result.failed.size()).arg(shown.join('\n')));
+            }
+
+            if (!result.deleted.isEmpty()) {
+                statusTxt_->setText(QStringLiteral("Deleted %1 files from %2 groups using ‘%3’. Regrouping…")
+                    .arg(result.deleted.size()).arg(groupCount).arg(ruleLabel));
+                refreshAfterDelete();
+            } else {
+                setInteractive(true);
+                showGroup(currentGroup_);
+                statusTxt_->setText(result.cancelled
+                    ? QStringLiteral("Bulk deletion cancelled before any files were deleted.")
+                    : QStringLiteral("No files were deleted."));
+            }
+        });
+
+        watcher->setFuture(QtConcurrent::run([toDelete=std::move(toDelete),self,post]() mutable {
+            BulkDeleteResult result;
+            for (int i=0;i<toDelete.size();++i) {
+                if (!self || self->cancelled_.load()) { result.cancelled=true; break; }
+                const QString& path=toDelete[i];
+                if (QFile::moveToTrash(path)) result.deleted << path;
+                else result.failed << path;
+                const int done=i+1;
+                if ((done&15)==0 || done==toDelete.size()) post(done);
+            }
+            return result;
+        }));
     }
 
     // === UI interactions ===
@@ -1558,6 +1807,8 @@ private:
             QPushButton#primaryButton:hover { background:#587f96; }
             QPushButton#dangerButton { background:#7d3038; border-color:#a64a55; color:white; }
             QPushButton#dangerButton:hover { background:#94404a; }
+            QPushButton#secondaryDangerButton { background:#493236; border-color:#805159; color:#f4e8ea; }
+            QPushButton#secondaryDangerButton:hover { background:#5c3a40; border-color:#9b626c; }
             QPushButton#quietButton { background:transparent; }
             QLineEdit, QComboBox { background:#1d1d1d; border:1px solid #484848; border-radius:7px; padding:8px; selection-background-color:#626262; }
             QLineEdit:focus, QComboBox:focus { border-color:#858585; }
@@ -1594,7 +1845,7 @@ private:
     }
 
     void setInteractive(bool e) {
-        for (QPushButton* b : {btnSelect_, btnRegroup_, btnDelete_}) if (b) b->setEnabled(e);
+        for (QPushButton* b : {btnSelect_, btnRegroup_, btnDelete_, btnDeleteAllGroups_}) if (b) b->setEnabled(e);
 
         QList<QWidget*> widgets = {
             groupsList_, sortCombo_, groupFilter_,
@@ -1803,8 +2054,10 @@ private:
     std::atomic<bool> scanning_{false};
     std::atomic<bool> cancelled_{false};
     std::atomic<bool> busy_{false};
+    std::atomic<bool> bulkDeleting_{false};
     QFutureWatcher<ScanResult>* scanWatcher_{};
     QFutureWatcher<GroupResult>* groupWatcher_{};
+    QFutureWatcher<BulkDeleteResult>* bulkDeleteWatcher_{};
     std::map<HashAlgo, std::shared_ptr<BKTree<BitHash>>> trees_;
 
     // Layout containers
@@ -1834,6 +2087,7 @@ private:
     QProgressBar* prog_{};
     QPushButton*  btnCancel_{};
     QPushButton*  btnDelete_{};
+    QPushButton*  btnDeleteAllGroups_{};
     QLineEdit*    search_{};
     QLineEdit*    groupFilter_{};
     QComboBox*    sortCombo_{};
