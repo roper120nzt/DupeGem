@@ -92,6 +92,12 @@ using BitHash = std::bitset<kHashBits>;
 enum class HashAlgo : int { DHash = 0, PHash, AHash, WHash, BHash, MD5, Count };
 enum class Md5KeepRule : int { Newest, Oldest, FilenameFirst, FilenameLast, ShortestName, LongestName };
 
+// Keep HashAlgo's numeric values stable for existing SQLite caches and CLI
+// callers. The selector can evolve independently through this display order.
+constexpr std::array<HashAlgo, 6> kAlgorithmDisplayOrder{
+    HashAlgo::MD5, HashAlgo::AHash, HashAlgo::DHash,
+    HashAlgo::WHash, HashAlgo::BHash, HashAlgo::PHash};
+
 inline const char* algoName(HashAlgo a) {
     switch (a) {
         case HashAlgo::DHash: return "Difference Hash (dHash)";
@@ -240,7 +246,7 @@ inline const char* algoSpeed(HashAlgo a) {
         case HashAlgo::WHash: return "Fast";
         case HashAlgo::BHash: return "Fast";
         case HashAlgo::PHash: return "Moderate";
-        case HashAlgo::MD5:   return "Disk-bound";
+        case HashAlgo::MD5:   return "Usually fastest";
         default: return "Unknown";
     }
 }
@@ -552,7 +558,7 @@ struct GroupResult {
     std::shared_ptr<BKTree<BitHash>> tree;
     QString error;
     QString cacheWarning;
-    HashAlgo algo=HashAlgo::DHash;
+    HashAlgo algo=HashAlgo::MD5;
     bool cancelled=false;
 };
 
@@ -832,10 +838,11 @@ public:
             auto* row = new QHBoxLayout;
             row->addWidget(new QLabel(QStringLiteral("Algorithm:")));
             algoCombo_ = new QComboBox;
-            for (int i=0;i<int(HashAlgo::Count);++i) {
-                const auto algo=static_cast<HashAlgo>(i);
+            for (const HashAlgo algo:kAlgorithmDisplayOrder) {
                 algoCombo_->addItem(QStringLiteral("%1 — %2")
-                                    .arg(QString::fromLatin1(algoName(algo)), QString::fromLatin1(algoSpeed(algo))));
+                                    .arg(QString::fromLatin1(algoName(algo)),
+                                         QString::fromLatin1(algoSpeed(algo))),
+                                    int(algo));
             }
             row->addWidget(algoCombo_, 1);
             ctl->addLayout(row);
@@ -1030,7 +1037,7 @@ public:
 
         // Keep the complete control deck stable and fully visible. The window
         // minimum size guarantees the fixed deck never needs a scrollbar.
-        controlsW_->setFixedSize(514,853);
+        controlsW_->setFixedSize(514,800);
         controlsW_->setSizePolicy(QSizePolicy::Fixed,QSizePolicy::Fixed);
         leftSplit_->setChildrenCollapsible(false);
         leftSplit_->addWidget(controlsW_);
@@ -1042,12 +1049,12 @@ public:
 
         // The groups list owns all space beneath the fixed control deck.
         QList<int> initSizes;
-        initSizes << 853     // exact reference-image height
+        initSizes << 800     // fixed settings-panel height
                   << 120;    // groups pane receives remaining height
         leftSplit_->setSizes(initSizes);
         QTimer::singleShot(0,this,[this]{
-            const int groupHeight=std::max(80,leftSplit_->height()-853-leftSplit_->handleWidth());
-            leftSplit_->setSizes({853,groupHeight});
+            const int groupHeight=std::max(80,leftSplit_->height()-800-leftSplit_->handleWidth());
+            leftSplit_->setSizes({800,groupHeight});
         });
 
         // ==== RIGHT: image grid viewer ====
@@ -1123,23 +1130,16 @@ connect(scBksp, &QShortcut::activated, this, [this]{
         connect(filterTimer_,&QTimer::timeout,this,&DupeGemMainWindow::applyGroupFilter);
         connect(searchTimer_,&QTimer::timeout,this,[this]{ showGroup(currentGroup_); });
         connect(md5TypeTimer_,&QTimer::timeout,this,[this]{
-            if (static_cast<HashAlgo>(algoCombo_->currentIndex())==HashAlgo::MD5
+            if (currentAlgorithm()==HashAlgo::MD5
                 && !busy_.load() && !currentDir_.isEmpty()) startScan(currentDir_);
         });
         connect(groupFilter_,&QLineEdit::textChanged,this,[this]{ filterTimer_->start(); });
         connect(algoCombo_,  qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int){
-            updateAlgorithmInfo();
-            // Disable threshold if MD5 is selected (exact matches only)
-            const bool md5 = (static_cast<HashAlgo>(algoCombo_->currentIndex()) == HashAlgo::MD5);
-            thresholdRow_->setVisible(!md5);
-            md5TypesRow_->setVisible(md5);
-            btnDeleteAllGroups_->setVisible(md5);
-            btnRegroup_->setText(md5 ? QStringLiteral("Rescan/Regroup Files")
-                                    : QStringLiteral("Rescan/Regroup Images"));
+            updateAlgorithmUi();
             if(!currentDir_.isEmpty() && !busy_.load()) startScan(currentDir_);
         });
         auto categoryChanged=[this](bool){
-            if (static_cast<HashAlgo>(algoCombo_->currentIndex())==HashAlgo::MD5)
+            if (currentAlgorithm()==HashAlgo::MD5)
                 md5TypeTimer_->start();
         };
         connect(md5Images_,&QCheckBox::toggled,this,categoryChanged);
@@ -1158,13 +1158,16 @@ connect(scBksp, &QShortcut::activated, this, [this]{
         connect(addTimer_, &QTimer::timeout, this, &DupeGemMainWindow::addThumbBatch);
 
         updateThrLabel();
-        updateAlgorithmInfo();
+        updateAlgorithmUi();
         applyModernTheme();
     }
 
     void scanFolderOnLaunch(const QString& path, int algorithm=-1) {
         QTimer::singleShot(0,this,[this,path,algorithm]{
-            if (algorithm>=0 && algorithm<int(HashAlgo::Count)) algoCombo_->setCurrentIndex(algorithm);
+            if (algorithm>=0 && algorithm<int(HashAlgo::Count)) {
+                const int index=algoCombo_->findData(algorithm);
+                if (index>=0) algoCombo_->setCurrentIndex(index);
+            }
             if (QDir(path).exists() && !busy_) startScan(QDir(path).absolutePath());
         });
     }
@@ -1215,7 +1218,7 @@ private:
         prog_->setRange(0,0); prog_->setVisible(true);
         statusTxt_->setText(QStringLiteral("Enumerating files..."));
 
-        const auto algo=static_cast<HashAlgo>(algoCombo_->currentIndex());
+        const auto algo=currentAlgorithm();
         const bool includeImages=algo!=HashAlgo::MD5 || md5Images_->isChecked();
         const bool includeVideos=algo==HashAlgo::MD5 && md5Videos_->isChecked();
         const bool includeOther =algo==HashAlgo::MD5 && md5Other_->isChecked();
@@ -1362,7 +1365,7 @@ private:
     }
 
     void startGrouping() {
-        const auto algo=static_cast<HashAlgo>(algoCombo_->currentIndex());
+        const auto algo=currentAlgorithm();
         if (images_.empty()) {
             busy_=false; prog_->setVisible(false); setInteractive(true);
             headerLabel_->setText(algo==HashAlgo::MD5
@@ -1579,7 +1582,7 @@ private:
 
     void deleteAllMd5Duplicates() {
         if (busy_.load()) return;
-        if (static_cast<HashAlgo>(algoCombo_->currentIndex()) != HashAlgo::MD5) {
+        if (currentAlgorithm() != HashAlgo::MD5) {
             QMessageBox::information(this, QStringLiteral("MD5 Required"),
                                      QStringLiteral("This action is available only in Exact MD5 mode."));
             return;
@@ -1813,11 +1816,28 @@ private:
     void applyFileSearch(const QString&) { showGroup(currentGroup_); }
 
     void updateAlgorithmInfo() {
-        const auto algo=static_cast<HashAlgo>(algoCombo_->currentIndex());
+        const auto algo=currentAlgorithm();
         algoInfo_->setText(QStringLiteral("<b>%1 speed:</b> %2<br>%3")
                            .arg(QString::fromLatin1(algoName(algo)),
                                 QString::fromLatin1(algoSpeed(algo)),
                                 algoDescription(algo)));
+    }
+
+    HashAlgo currentAlgorithm() const {
+        bool ok=false;
+        const int value=algoCombo_->currentData().toInt(&ok);
+        return ok && value>=0 && value<int(HashAlgo::Count)
+            ? static_cast<HashAlgo>(value) : HashAlgo::MD5;
+    }
+
+    void updateAlgorithmUi() {
+        updateAlgorithmInfo();
+        const bool md5=currentAlgorithm()==HashAlgo::MD5;
+        thresholdRow_->setVisible(!md5);
+        md5TypesRow_->setVisible(md5);
+        btnDeleteAllGroups_->setVisible(md5);
+        btnRegroup_->setText(md5 ? QStringLiteral("Rescan/Regroup Files")
+                                : QStringLiteral("Rescan/Regroup Images"));
     }
 
     void updateThrLabel() {
@@ -1834,7 +1854,7 @@ private:
             const int idx=pendingThumbIndices_[i];
             if (idx<0 || idx>=int(images_.size()) || currentLeaderIndex_<0 || currentLeaderIndex_>=int(images_.size())) continue;
             auto* t=new ThumbWidget(images_[size_t(idx)],images_[size_t(currentLeaderIndex_)],
-                                    static_cast<HashAlgo>(algoCombo_->currentIndex()),thumbHeight_,thumbContainer_);
+                                    currentAlgorithm(),thumbHeight_,thumbContainer_);
             t->setChecked(images_[size_t(idx)].selected);
             connect(t,&ThumbWidget::checkedChanged,this,[this,idx](bool on){
                 if(idx<int(images_.size())) images_[size_t(idx)].selected=on;
