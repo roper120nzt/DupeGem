@@ -1,7 +1,8 @@
 # DupeGem
 
 DupeGem is a Qt 6 / C++17 duplicate-image finder for Windows. It supports five
-perceptual hashes for visually similar images and MD5 for byte-identical files.
+perceptual hashes for visually similar images and a staged XXH3/BLAKE3 pipeline
+for byte-identical files.
 
 DupeGem was originally started because many duplicate-image finders are paid,
 too slow for large libraries, or unable to handle collections of 50,000+ images.
@@ -50,9 +51,9 @@ file has no usable preview, DupeGem develops it with LibRaw. This fallback is
 limited to two concurrent images to prevent large RAW files from exhausting
 memory.
 
-## Exact MD5 file categories
+## Exact-file categories
 
-Exact MD5 mode can scan three independently selectable categories:
+Exact Files mode can scan three independently selectable categories:
 
 - **Images** — enabled by default and includes every image format listed above.
 - **Videos** — common formats including AVI, MKV, MOV, MP4, MPEG, MTS/M2TS,
@@ -60,8 +61,8 @@ Exact MD5 mode can scan three independently selectable categories:
 - **Other** — every readable file that is not classified as an image or video.
 
 Any combination can be enabled. Perceptual algorithms remain image-only.
-DupeGem's SQLite cache and its journal files are always excluded. MD5 content
-is still read only for files sharing the same byte size, regardless of category.
+DupeGem's SQLite cache and its journal files are always excluded. File contents
+are read only when another selected file has the same byte size.
 
 Video cards display a static frame requested lazily from the Windows Explorer
 thumbnail provider. This reuses Windows' thumbnail cache and adds no playback
@@ -70,11 +71,11 @@ availability depends on the codecs and thumbnail handlers installed in Windows.
 
 ## Build prerequisites
 
-Install Qt 6, libheif, and thread-safe LibRaw in the same MSYS2 MinGW64
+Install Qt 6, libheif, thread-safe LibRaw, xxHash, and libjpeg-turbo in the same MSYS2 MinGW64
 environment used by `qmake6`:
 
 ```bash
-pacman -S --needed mingw-w64-x86_64-qt6-base mingw-w64-x86_64-libheif mingw-w64-x86_64-libraw
+pacman -S --needed mingw-w64-x86_64-qt6-base mingw-w64-x86_64-libheif mingw-w64-x86_64-libraw mingw-w64-x86_64-xxhash mingw-w64-x86_64-libjpeg-turbo
 ```
 
 The existing Notepad++ build command remains unchanged. Run `qmake6 main.pro`
@@ -92,7 +93,7 @@ powershell -ExecutionPolicy Bypass -File .\package-portable.ps1
 The script creates:
 
 - `portable\DupeGem\DupeGem.exe` with the required Qt/MinGW DLLs and plugins.
-- `portable\DupeGem-portable.zip` for distribution.
+- `portable\DupeGem-v0.4.0-portable.zip` for distribution.
 
 Windows Qt applications cannot be reduced to a literal single EXE when using
 the normal dynamic MSYS2 Qt packages. That requires compiling a separate static
@@ -107,14 +108,19 @@ cards are created in small batches as they enter the gallery rather than creatin
 tens of thousands of widgets at once.
 
 DupeGem stores scan metadata and hashes in a `.dupegem_cache.sqlite` file inside
-each scanned folder. Only the selected algorithm is calculated initially. When
-you switch algorithms, its missing hashes are calculated once and persisted, so
-subsequent switches and rescans reuse them. Exact MD5 also avoids reading file
-contents until same-size candidates exist.
+each scanned folder. By default, one 64×64 grayscale decode calculates and saves
+dHash, aHash, pHash, wHash, and bHash in one pass. Switching algorithms is then
+immediate. **Cache all hashes** can be disabled for a lower-power, selected-only
+scan.
 
-Exact MD5 is the default algorithm. The selector is ordered roughly from fastest
-to slowest: MD5, aHash, dHash, wHash, bHash, then pHash. Existing cache algorithm
-identifiers remain unchanged, so upgrades continue to reuse saved hashes.
+Exact Files is the default algorithm. It groups by size, removes hardlinks using
+Windows file IDs, checks the first/final 16 KiB with XXH3, then checks 16 KiB at
+25/50/75% only for survivors. Full SIMD-dispatched BLAKE3 runs only after both
+sample gates collide. Automatic bulk deletion does
+a final byte-for-byte comparison before moving anything to the Recycle Bin.
+The selector is ordered roughly from fastest to slowest: Exact Files, aHash,
+dHash, wHash, bHash, then pHash. The internal legacy algorithm identifier remains
+unchanged so older cache databases and command-line callers stay compatible.
 
 Hash results are committed to SQLite every 1,000 images, including completed
 work from the active batch when you press Cancel. Starting the scan again resumes
@@ -124,18 +130,30 @@ Similarity groups use representative matching: every member must match the
 group's first image at the selected threshold. This prevents long chains of
 indirectly similar images from collapsing into one misleading group.
 
-Exact MD5 mode includes a **Delete From All Groups** action for keeping one file
+Exact Files mode includes a **Delete From All Groups** action for keeping one file
 from every byte-identical group and moving the rest to the Windows Recycle Bin.
 The keeper can be selected by newest or oldest modified time, filename order,
 or shortest/longest filename. Bulk deletion runs in the background and can be
 cancelled between files.
 
-The default decoder pool is capped at eight threads to prevent large or unusual
-images from multiplying peak memory usage. Override it when benchmarking a fast
-SSD and a machine with ample memory:
+Discovery, decoding, hashing, cache writing, and grouping form a bounded streaming
+pipeline; no 1,000-image batch barrier holds up faster work. JPEGs and small files
+receive queue priority, while HEIF and RAW work have separate concurrency limits.
+JPEG hashing uses EXIF thumbnails when suitable, otherwise libjpeg-turbo decoder
+scaling and direct grayscale output. HEIF thumbnails and RAW embedded previews are
+preferred before full decoding.
+
+Exact-file reader limits adapt to the storage device: one reader on rotational
+media, two on a conventional SSD, and up to four on NVMe. The decoder pool uses
+up to eight workers, with lower defaults on slower storage. Override the limits
+when benchmarking:
 
 ```powershell
 $env:DUPEGEM_THREADS = 12
+$env:DUPEGEM_EXACT_THREADS = 4
+$env:DUPEGEM_HEIF_THREADS = 4
+$env:DUPEGEM_RAW_PREVIEW_THREADS = 4
+$env:DUPEGEM_RAW_FULL_THREADS = 2
 ```
 
 Qt image allocations are limited to 128 MB per decoded image as a final guard
@@ -148,3 +166,48 @@ $env:DUPEGEM_IMAGE_LIMIT_MB = 256
 
 The cache is safe to delete whenever you want a completely fresh scan; DupeGem
 will recreate it. Older `.dupegem_cache.dat` files are no longer used.
+
+For libraries of 50,000 or more hashes and thresholds up to 15, DupeGem uses a
+parallel 16×16-bit sorted-band index with exact 256-bit Hamming verification.
+Smaller libraries or broader thresholds use a compact contiguous BK-tree. Group
+queries run in parallel chunks but group assignment remains deterministic and
+preserves representative matching.
+
+On NTFS, DupeGem stores volume/file IDs and a change-journal cursor. When Windows
+grants journal access, an unchanged rescan can apply only USN changes instead of
+walking the entire directory tree. Journal expiry, unavailable permissions,
+network filesystems, and directory renames fall back automatically to the normal
+streaming enumeration path.
+
+## Benchmark and regression tests
+
+The benchmark mode is headless and does not load a Qt platform plugin:
+
+```powershell
+.\release\main.exe --benchmark "D:\Photos" --algorithm dhash --output results.json
+```
+
+Use `--selected-only` to measure the low-power perceptual mode. The JSON report
+includes discovery, cache lookup, decode/hash, SQLite, index/query, bytes-read,
+cache-hit, per-format, JPEG-decoder comparison, throughput, and peak-memory data.
+Use `--cancel-after N` in automated tests to stop after a controlled number of
+new hashes and verify that the next run resumes from the saved cache.
+
+Build and run the exact/index regression suite with:
+
+```powershell
+cd tests
+qmake6 performance_tests.pro -o Makefile.performance
+mingw32-make -f Makefile.performance
+.\release\performance_tests.exe
+.\release\performance_tests.exe --benchmark-size 50000
+```
+
+The second command compares the exact BK-tree and sorted-band candidate indexes
+on 50,000 deterministic hashes. From the project root, run the full cache and
+filesystem integration suite or a disposable 50,000-file cold/warm stress scan:
+
+```powershell
+.\tests\integration_tests.ps1
+.\tests\stress_50000.ps1
+```

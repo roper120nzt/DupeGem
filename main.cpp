@@ -2,13 +2,11 @@
 
 // Qt
 #include <QApplication>
-#include <QByteArrayView>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QColorSpace>
 #include <QCoreApplication>
-#include <QCryptographicHash>
 #include <QDataStream>
 #include <QDebug>
 #include <QDir>
@@ -24,6 +22,10 @@
 #include <QIcon>
 #include <QImage>
 #include <QImageReader>
+#include <QElapsedTimer>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
@@ -35,7 +37,6 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QRegularExpression>
-#include <QRunnable>
 #include <QSaveFile>
 #include <QScrollArea>
 #include <QScrollBar>
@@ -47,7 +48,6 @@
 #include <QSqlQuery>
 #include <QStyle>
 #include <QThread>
-#include <QThreadPool>
 #include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
@@ -68,18 +68,38 @@
 #include <atomic>
 #include <bitset>
 #include <cmath>
+#include <condition_variable>
+#include <cstring>
 #include <cstdio>
+#include <chrono>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <map>
 #include <memory>
 #include <numeric>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <psapi.h>
+#endif
+
 // Local
 #include "bk_tree.h"
+#include "band_index.h"
+#include "exact_hash.h"
 #include "image_decoder.h"
+#include "ntfs_journal.h"
 
 namespace dg {
 
@@ -105,7 +125,7 @@ inline const char* algoName(HashAlgo a) {
         case HashAlgo::AHash: return "Average Hash (aHash)";
         case HashAlgo::WHash: return "Wavelet Hash (wHash)";
         case HashAlgo::BHash: return "BlockMean Hash (bHash)";
-        case HashAlgo::MD5:   return "Exact MD5 (byte-identical)";
+        case HashAlgo::MD5:   return "Exact Files (XXH3 + BLAKE3)";
         default: return "Unknown";
     }
 }
@@ -269,8 +289,8 @@ inline QString algoDescription(HashAlgo a) {
             return QStringLiteral("Compares median brightness across local blocks. Handles broad brightness changes well and "
                                   "is more spatially detailed than aHash.");
         case HashAlgo::MD5:
-            return QStringLiteral("Finds byte-for-byte identical files only. Files are bucketed by size first, so disk data is "
-                                  "read only for size collisions; visually identical re-encodes will not match.");
+            return QStringLiteral("Finds byte-for-byte identical files. Size buckets are narrowed with sampled XXH3 before "
+                                  "full BLAKE3 hashing; hardlinks are skipped and bulk deletion verifies bytes directly.");
         default:
             return {};
     }
@@ -366,11 +386,18 @@ inline BitHash wHash(const QImage& in){
 struct ImgMeta {
     QString file;
     BitHash phash,ahash,dhash,bhash,whash;
+    QByteArray blake3;
+    QByteArray fileIdentity;
     QString md5;
+    quint64 quickHash = 0;
+    quint64 sampleHash = 0;
     QSize   resolution;
     qint64  size = 0;
     qint64  mtime = 0;
+    qint64  fileUsn = 0;
     quint8  hashMask = 0;
+    bool    quickValid = false;
+    bool    sampleValid = false;
     bool    selected = false;
     int     group = -1;
     bool    valid = true;
@@ -382,6 +409,13 @@ inline quint8 hashBit(HashAlgo a) {
 inline bool hasHash(const ImgMeta& m, HashAlgo a) {
     return a!=HashAlgo::MD5 && (m.hashMask & hashBit(a));
 }
+
+constexpr quint8 kAllPerceptualHashes =
+    quint8((1u << unsigned(HashAlgo::DHash))
+           | (1u << unsigned(HashAlgo::PHash))
+           | (1u << unsigned(HashAlgo::AHash))
+           | (1u << unsigned(HashAlgo::WHash))
+           | (1u << unsigned(HashAlgo::BHash)));
 
 inline const BitHash& pickHash(const ImgMeta& m, HashAlgo a) {
     switch (a) {
@@ -396,12 +430,210 @@ inline const BitHash& pickHash(const ImgMeta& m, HashAlgo a) {
 
 // ---------- Background work & SQLite cache ----------
 
-class FunctionTask final : public QRunnable {
+template <typename Work, typename Flush>
+void runPersistentPipeline(size_t count, int threadCount,
+                           const std::atomic<bool>& cancelled,
+                           Work&& work, Flush&& flush) {
+    if (count==0) return;
+    const int workers=std::clamp(threadCount,1,int(count));
+    std::atomic<size_t> next{0};
+    std::atomic<int> active{workers};
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::vector<int> completed;
+    completed.reserve(1000);
+    std::vector<std::thread> threads;
+    threads.reserve(size_t(workers));
+    for (int worker=0;worker<workers;++worker) {
+        threads.emplace_back([&]{
+            while (!cancelled.load()) {
+                const size_t position=next.fetch_add(1);
+                if (position>=count) break;
+                const int row=work(position);
+                if (row>=0) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    completed.push_back(row);
+                    if (completed.size()>=1000) ready.notify_one();
+                }
+            }
+            --active;
+            ready.notify_one();
+        });
+    }
+    while (active.load()>0) {
+        std::vector<int> batch;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            ready.wait_for(lock,std::chrono::seconds(2),[&]{
+                return completed.size()>=1000 || active.load()==0;
+            });
+            batch.swap(completed);
+        }
+        if (!batch.empty()) flush(batch);
+    }
+    for (auto& thread:threads) thread.join();
+    std::vector<int> tail;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        tail.swap(completed);
+    }
+    if (!tail.empty()) flush(tail);
+}
+
+template <typename T>
+class BoundedQueue {
 public:
-    explicit FunctionTask(std::function<void()> fn) : fn_(std::move(fn)) { setAutoDelete(true); }
-    void run() override { fn_(); }
+    explicit BoundedQueue(size_t capacity) : capacity_(std::max<size_t>(1,capacity)) {}
+
+    bool push(T value,const std::atomic<bool>& cancelled) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        notFull_.wait(lock,[&]{ return closed_ || cancelled.load() || items_.size()<capacity_; });
+        if (closed_ || cancelled.load()) return false;
+        items_.push_back(std::move(value));
+        notEmpty_.notify_one();
+        return true;
+    }
+
+    bool push(T value) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        notFull_.wait(lock,[&]{ return closed_ || items_.size()<capacity_; });
+        if (closed_) return false;
+        items_.push_back(std::move(value));
+        notEmpty_.notify_one();
+        return true;
+    }
+
+    bool pop(T& value) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        notEmpty_.wait(lock,[&]{ return closed_ || !items_.empty(); });
+        if (items_.empty()) return false;
+        value=std::move(items_.front());
+        items_.pop_front();
+        notFull_.notify_one();
+        return true;
+    }
+
+    // 1=item, 0=timeout, -1=closed and drained.
+    int popFor(T& value,std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!notEmpty_.wait_for(lock,timeout,[&]{ return closed_ || !items_.empty(); })) return 0;
+        if (items_.empty()) return -1;
+        value=std::move(items_.front());
+        items_.pop_front();
+        notFull_.notify_one();
+        return 1;
+    }
+
+    void close() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        closed_=true;
+        notEmpty_.notify_all();
+        notFull_.notify_all();
+    }
+
 private:
-    std::function<void()> fn_;
+    size_t capacity_;
+    std::deque<T> items_;
+    bool closed_{};
+    std::mutex mutex_;
+    std::condition_variable notEmpty_;
+    std::condition_variable notFull_;
+};
+
+void enumerateFilesParallel(const QString& rootPath,const QStringList& nameFilters,
+                            bool recurse,int threadCount,
+                            const std::atomic<bool>& cancelled,
+                            BoundedQueue<QString>& output) {
+    std::deque<QString> directories{rootPath};
+    size_t outstanding=1;
+    bool finished=false;
+    std::mutex mutex;
+    std::condition_variable ready;
+    const int workers=recurse ? std::clamp(threadCount,1,8) : 1;
+    std::vector<std::thread> threads;
+    threads.reserve(size_t(workers));
+    for (int worker=0;worker<workers;++worker) threads.emplace_back([&] {
+        while (!cancelled.load()) {
+            QString directoryPath;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                ready.wait_for(lock,std::chrono::milliseconds(100),[&] {
+                    return cancelled.load()||finished||!directories.empty();
+                });
+                if (cancelled.load()||finished) return;
+                if (directories.empty()) continue;
+                directoryPath=std::move(directories.front());
+                directories.pop_front();
+            }
+
+            QDirIterator iterator(directoryPath,QDir::AllEntries|QDir::Readable
+                                  |QDir::NoDotAndDotDot,QDirIterator::NoIteratorFlags);
+            while (!cancelled.load() && iterator.hasNext()) {
+                const QString path=iterator.next();
+                const QFileInfo info=iterator.fileInfo();
+                if (info.isDir()) {
+                    if (!recurse||info.isSymLink()) continue;
+                    std::lock_guard<std::mutex> lock(mutex);
+                    directories.push_back(path); ++outstanding; ready.notify_one();
+                } else if (info.isFile() && QDir::match(nameFilters,info.fileName())) {
+                    if (!output.push(path,cancelled)) break;
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (--outstanding==0) finished=true;
+                ready.notify_all();
+            }
+        }
+    });
+    ready.notify_all();
+    for (auto& thread:threads) thread.join();
+    output.close();
+}
+
+template <typename T>
+class BoundedPriorityQueue {
+public:
+    explicit BoundedPriorityQueue(size_t capacity) : capacity_(std::max<size_t>(1,capacity)) {}
+
+    bool push(T value,int priority,const std::atomic<bool>& cancelled) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        notFull_.wait(lock,[&]{return closed_||cancelled.load()||items_.size()<capacity_;});
+        if (closed_||cancelled.load()) return false;
+        items_.push_back(Entry{priority,sequence_++,std::move(value)});
+        std::push_heap(items_.begin(),items_.end(),lowerPriority);
+        notEmpty_.notify_one();
+        return true;
+    }
+
+    bool pop(T& value) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        notEmpty_.wait(lock,[&]{return closed_||!items_.empty();});
+        if (items_.empty()) return false;
+        std::pop_heap(items_.begin(),items_.end(),lowerPriority);
+        value=std::move(items_.back().value);
+        items_.pop_back();
+        notFull_.notify_one();
+        return true;
+    }
+
+    void close() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        closed_=true; notEmpty_.notify_all(); notFull_.notify_all();
+    }
+
+private:
+    struct Entry { int priority{}; quint64 sequence{}; T value; };
+    static bool lowerPriority(const Entry& left,const Entry& right) {
+        return left.priority<right.priority
+            || (left.priority==right.priority && left.sequence>right.sequence);
+    }
+    size_t capacity_;
+    quint64 sequence_{};
+    std::vector<Entry> items_;
+    bool closed_{};
+    std::mutex mutex_;
+    std::condition_variable notEmpty_,notFull_;
 };
 
 inline int workerCount() {
@@ -413,17 +645,66 @@ inline int workerCount() {
     return ok && requested>0 ? std::clamp(requested,1,64) : threads;
 }
 
-inline bool readAndHash(ImgMeta& m, HashAlgo algo) {
+QSize hashDecodeSize(HashAlgo algo) {
+    switch (algo) {
+        case HashAlgo::AHash: return QSize(16,16);
+        case HashAlgo::DHash: return QSize(17,16);
+        case HashAlgo::PHash: return QSize(32,32);
+        case HashAlgo::WHash: return QSize(32,32);
+        case HashAlgo::BHash: return QSize(64,64);
+        default: return QSize(64,64);
+    }
+}
+
+inline int exactWorkerCount(const QString& rootPath) {
+    bool ok=false;
+    const int requested=qEnvironmentVariableIntValue("DUPEGEM_EXACT_THREADS",&ok);
+    if (ok && requested>0) return std::clamp(requested,1,16);
+    switch (storageClass(rootPath)) {
+        case StorageClass::Rotational: return 1;
+        case StorageClass::SolidState: return std::min(2,workerCount());
+        case StorageClass::Nvme: return std::min(4,workerCount());
+        default: return std::min(2,workerCount());
+    }
+}
+
+inline int decoderWorkerCount(const QString& rootPath) {
+    if (qEnvironmentVariableIsSet("DUPEGEM_THREADS")) return workerCount();
+    switch (storageClass(rootPath)) {
+        case StorageClass::Rotational: return std::min(4,workerCount());
+        case StorageClass::SolidState: return std::min(6,workerCount());
+        case StorageClass::Nvme: return workerCount();
+        default: return std::min(4,workerCount());
+    }
+}
+
+inline int directoryWorkerCount(const QString& rootPath) {
+    switch (storageClass(rootPath)) {
+        case StorageClass::Rotational: return 1;
+        case StorageClass::SolidState: return 2;
+        case StorageClass::Nvme: return 4;
+        default: return 1;
+    }
+}
+
+inline bool readAndHash(ImgMeta& m, HashAlgo algo, bool calculateAll = false) {
     if (algo==HashAlgo::MD5) {
         const QFileInfo info(m.file);
         return info.isFile() && info.isReadable();
     }
     QSize source;
-    QImage img=decodeImage(m.file,QSize(64,64),Qt::IgnoreAspectRatio,&source);
+    QImage img=decodeHashImage(m.file,calculateAll ? QSize(64,64) : hashDecodeSize(algo),
+                               &source);
     if (img.isNull()) return false;
     if (!m.resolution.isValid()) m.resolution=source;
     img.setColorSpace(QColorSpace());
     const QImage gray=img.convertToFormat(QImage::Format_Grayscale8);
+    if (calculateAll) {
+        m.dhash=dHash(gray); m.phash=pHash(gray); m.ahash=aHash(gray);
+        m.whash=wHash(gray); m.bhash=bHash(gray);
+        m.hashMask |= kAllPerceptualHashes;
+        return true;
+    }
     switch (algo) {
         case HashAlgo::DHash: m.dhash=dHash(gray); break;
         case HashAlgo::PHash: m.phash=pHash(gray); break;
@@ -455,7 +736,30 @@ public:
             "width INTEGER, height INTEGER, dhash BLOB, phash BLOB, ahash BLOB, "
             "whash BLOB, bhash BLOB, md5 TEXT)"))) {
             error_=q.lastError().text(); db_.close();
+            return;
         }
+        const std::array<std::pair<QString,QString>,6> additions{{
+            {QStringLiteral("prehash"),QStringLiteral("BLOB")},
+            {QStringLiteral("prehash_version"),QStringLiteral("INTEGER")},
+            {QStringLiteral("blake3"),QStringLiteral("BLOB")},
+            {QStringLiteral("file_identity"),QStringLiteral("BLOB")},
+            {QStringLiteral("file_usn"),QStringLiteral("INTEGER")},
+            {QStringLiteral("quickhash"),QStringLiteral("BLOB")}}};
+        QSet<QString> columns;
+        if (q.exec(QStringLiteral("PRAGMA table_info(images)")))
+            while (q.next()) columns.insert(q.value(1).toString().toLower());
+        for (const auto& addition:additions) {
+            if (columns.contains(addition.first)) continue;
+            if (!q.exec(QStringLiteral("ALTER TABLE images ADD COLUMN %1 %2")
+                        .arg(addition.first,addition.second))) {
+                error_=q.lastError().text(); db_.close(); return;
+            }
+        }
+        q.exec(QStringLiteral(
+            "CREATE INDEX IF NOT EXISTS images_file_identity ON images(file_identity)"));
+        if (!q.exec(QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS cache_meta(key TEXT PRIMARY KEY,value BLOB)")))
+            error_=q.lastError().text();
     }
     ~SqliteCache() {
         if (db_.isValid()) db_.close();
@@ -465,15 +769,147 @@ public:
     bool isOpen() const { return db_.isOpen() && error_.isEmpty(); }
     QString error() const { return error_; }
 
-    QHash<QString,ImgMeta> loadAll() {
-        QHash<QString,ImgMeta> out;
-        if (!isOpen()) return out;
+    bool beginScanTracking() {
+        if (!isOpen()) return false;
         QSqlQuery q(db_);
         if (!q.exec(QStringLiteral(
-            "SELECT path,mtime,size,width,height,dhash,phash,ahash,whash,bhash,md5 FROM images"))) {
-            error_=q.lastError().text(); return out;
+            "CREATE TEMP TABLE IF NOT EXISTS scan_seen(path TEXT PRIMARY KEY) WITHOUT ROWID"))
+            || !q.exec(QStringLiteral("DELETE FROM scan_seen"))) {
+            error_=q.lastError().text(); return false;
         }
+        return true;
+    }
+
+    bool markSeen(const QStringList& relativePaths) {
+        if (!isOpen() || relativePaths.isEmpty()) return isOpen();
+        if (!db_.transaction()) { error_=db_.lastError().text(); return false; }
+        QSqlQuery q(db_);
+        q.prepare(QStringLiteral("INSERT OR IGNORE INTO scan_seen(path) VALUES(?)"));
+        for (const QString& path:relativePaths) {
+            q.bindValue(0,path);
+            if (!q.exec()) { error_=q.lastError().text(); db_.rollback(); return false; }
+        }
+        if (!db_.commit()) { error_=db_.lastError().text(); return false; }
+        return true;
+    }
+
+    bool removeMissingUnseen(const QString& rootPath) {
+        if (!isOpen()) return false;
+        QSqlQuery q(db_);
+        if (!q.exec(QStringLiteral(
+            "SELECT images.path FROM images LEFT JOIN scan_seen ON scan_seen.path=images.path "
+            "WHERE scan_seen.path IS NULL"))) {
+            error_=q.lastError().text(); return false;
+        }
+        const QDir root(rootPath);
+        QStringList missing;
         while (q.next()) {
+            const QString path=q.value(0).toString();
+            if (!QFileInfo::exists(root.absoluteFilePath(path))) missing << path;
+        }
+        q.finish();
+        return removePaths(missing);
+    }
+
+    QByteArray meta(const QString& key) {
+        if (!isOpen()) return {};
+        QSqlQuery q(db_);
+        q.prepare(QStringLiteral("SELECT value FROM cache_meta WHERE key=?"));
+        q.bindValue(0,key);
+        if (!q.exec()) { error_=q.lastError().text(); return {}; }
+        return q.next() ? q.value(0).toByteArray() : QByteArray{};
+    }
+
+    bool setMeta(const QString& key,const QByteArray& value) {
+        if (!isOpen()) return false;
+        QSqlQuery q(db_);
+        q.prepare(QStringLiteral(
+            "INSERT INTO cache_meta(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value"));
+        q.bindValue(0,key); q.bindValue(1,value);
+        if (!q.exec()) { error_=q.lastError().text(); return false; }
+        return true;
+    }
+
+    std::vector<ImgMeta> loadAllRows(const QString& rootPath) {
+        std::vector<ImgMeta> rows;
+        if (!isOpen()) return rows;
+        QSqlQuery q(db_);
+        if (!q.exec(QStringLiteral(
+            "SELECT path,mtime,size,width,height,dhash,phash,ahash,whash,bhash,md5,"
+            "prehash,prehash_version,blake3,file_identity,file_usn,quickhash FROM images"))) {
+            error_=q.lastError().text(); return rows;
+        }
+        const QDir root(rootPath);
+        while (q.next()) {
+            ImgMeta m;
+            m.file=root.absoluteFilePath(q.value(0).toString());
+            m.mtime=q.value(1).toLongLong(); m.size=q.value(2).toLongLong();
+            m.resolution=QSize(q.value(3).toInt(),q.value(4).toInt());
+            const std::array<HashAlgo,5> algos{HashAlgo::DHash,HashAlgo::PHash,HashAlgo::AHash,HashAlgo::WHash,HashAlgo::BHash};
+            for (int i=0;i<5;++i) {
+                const QByteArray bytes=q.value(5+i).toByteArray();
+                if (bytes.size()!=kHashBits/8) continue;
+                switch (algos[size_t(i)]) {
+                    case HashAlgo::DHash: m.dhash=hashFromBytes(bytes); break;
+                    case HashAlgo::PHash: m.phash=hashFromBytes(bytes); break;
+                    case HashAlgo::AHash: m.ahash=hashFromBytes(bytes); break;
+                    case HashAlgo::WHash: m.whash=hashFromBytes(bytes); break;
+                    case HashAlgo::BHash: m.bhash=hashFromBytes(bytes); break;
+                    default: break;
+                }
+                m.hashMask|=hashBit(algos[size_t(i)]);
+            }
+            m.md5=q.value(10).toString();
+            const QByteArray prehash=q.value(11).toByteArray();
+            if (prehash.size()==8 && q.value(12).toInt()==kExactPrehashVersion) {
+                for (int i=0;i<8;++i) m.sampleHash|=quint64(uchar(prehash[i]))<<(i*8);
+                m.sampleValid=true;
+            }
+            m.blake3=q.value(13).toByteArray();
+            m.fileIdentity=q.value(14).toByteArray();
+            m.fileUsn=q.value(15).toLongLong();
+            const QByteArray quickhash=q.value(16).toByteArray();
+            if (quickhash.size()==8 && q.value(12).toInt()==kExactPrehashVersion) {
+                for (int i=0;i<8;++i) m.quickHash|=quint64(uchar(quickhash[i]))<<(i*8);
+                m.quickValid=true;
+            }
+            m.valid=true;
+            rows.push_back(std::move(m));
+        }
+        return rows;
+    }
+
+    bool find(const QString& relativePath, const QByteArray& identity,
+              ImgMeta& output, QString* storedPath = nullptr) {
+        if (!isOpen()) return false;
+        auto execute=[this](const QString& sql,const QVariant& value,QSqlQuery& q){
+            q.prepare(sql); q.bindValue(0,value);
+            if (!q.exec()) { error_=q.lastError().text(); return false; }
+            return q.next();
+        };
+        const QString fields=QStringLiteral(
+            "path,mtime,size,width,height,dhash,phash,ahash,whash,bhash,md5,"
+            "prehash,prehash_version,blake3,file_identity,file_usn,quickhash");
+        QSqlQuery q(db_);
+        bool found=execute(QStringLiteral("SELECT %1 FROM images WHERE path=? LIMIT 1").arg(fields),
+                           relativePath,q);
+        // A path can be replaced while retaining the same size and timestamp.
+        // When both sides have a Windows file ID, never reuse that stale row.
+        if (found && !identity.isEmpty()) {
+            const QByteArray storedIdentity=q.value(14).toByteArray();
+            if (!storedIdentity.isEmpty() && storedIdentity!=identity) {
+                found=false;
+                q.finish();
+            }
+        }
+        if (!found && !identity.isEmpty()) {
+            q.finish();
+            found=execute(QStringLiteral("SELECT %1 FROM images WHERE file_identity=? LIMIT 1").arg(fields),
+                          identity,q);
+        }
+        if (!found) return false;
+        {
             ImgMeta m;
             const QString rel=q.value(0).toString();
             m.mtime=q.value(1).toLongLong(); m.size=q.value(2).toLongLong();
@@ -493,9 +929,24 @@ public:
                 m.hashMask|=hashBit(algos[i]);
             }
             m.md5=q.value(10).toString();
-            out.insert(rel,std::move(m));
+            const QByteArray prehash=q.value(11).toByteArray();
+            if (prehash.size()==8 && q.value(12).toInt()==kExactPrehashVersion) {
+                m.sampleHash=0;
+                for (int i=0;i<8;++i) m.sampleHash|=quint64(uchar(prehash[i]))<<(i*8);
+                m.sampleValid=true;
+            }
+            m.blake3=q.value(13).toByteArray();
+            m.fileIdentity=q.value(14).toByteArray();
+            m.fileUsn=q.value(15).toLongLong();
+            const QByteArray quickhash=q.value(16).toByteArray();
+            if (quickhash.size()==8 && q.value(12).toInt()==kExactPrehashVersion) {
+                for (int i=0;i<8;++i) m.quickHash|=quint64(uchar(quickhash[i]))<<(i*8);
+                m.quickValid=true;
+            }
+            output=std::move(m);
+            if (storedPath) *storedPath=rel;
         }
-        return out;
+        return true;
     }
 
     bool saveRows(const QString& rootPath, const std::vector<ImgMeta>& images,
@@ -504,11 +955,14 @@ public:
         if (!db_.transaction()) { error_=db_.lastError().text(); return false; }
         QSqlQuery q(db_);
         q.prepare(QStringLiteral(
-            "INSERT INTO images(path,mtime,size,width,height,dhash,phash,ahash,whash,bhash,md5) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
+            "INSERT INTO images(path,mtime,size,width,height,dhash,phash,ahash,whash,bhash,md5,prehash,prehash_version,blake3,file_identity,file_usn,quickhash) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
             "mtime=excluded.mtime,size=excluded.size,width=excluded.width,height=excluded.height,"
             "dhash=excluded.dhash,phash=excluded.phash,ahash=excluded.ahash,"
-            "whash=excluded.whash,bhash=excluded.bhash,md5=excluded.md5"));
+            "whash=excluded.whash,bhash=excluded.bhash,md5=excluded.md5,"
+            "prehash=excluded.prehash,prehash_version=excluded.prehash_version,"
+            "blake3=excluded.blake3,file_identity=excluded.file_identity,"
+            "file_usn=excluded.file_usn,quickhash=excluded.quickhash"));
         const QDir root(rootPath);
         for (int row: rows) {
             if (row<0 || row>=int(images.size())) continue;
@@ -521,6 +975,23 @@ public:
             const std::array<HashAlgo,5> algos{HashAlgo::DHash,HashAlgo::PHash,HashAlgo::AHash,HashAlgo::WHash,HashAlgo::BHash};
             for (HashAlgo a: algos) q.bindValue(bind++,hasHash(m,a) ? QVariant(hashBytes(pickHash(m,a))) : QVariant());
             q.bindValue(bind++,m.md5.isEmpty() ? QVariant() : QVariant(m.md5));
+            QByteArray prehash;
+            if (m.sampleValid) {
+                prehash.resize(8);
+                for (int i=0;i<8;++i) prehash[i]=char((m.sampleHash>>(i*8))&0xffu);
+            }
+            q.bindValue(bind++,prehash.isEmpty() ? QVariant() : QVariant(prehash));
+            q.bindValue(bind++,m.quickValid||m.sampleValid
+                ? QVariant(kExactPrehashVersion) : QVariant());
+            q.bindValue(bind++,m.blake3.isEmpty() ? QVariant() : QVariant(m.blake3));
+            q.bindValue(bind++,m.fileIdentity.isEmpty() ? QVariant() : QVariant(m.fileIdentity));
+            q.bindValue(bind++,m.fileUsn ? QVariant(m.fileUsn) : QVariant());
+            QByteArray quickhash;
+            if (m.quickValid) {
+                quickhash.resize(8);
+                for (int i=0;i<8;++i) quickhash[i]=char((m.quickHash>>(i*8))&0xffu);
+            }
+            q.bindValue(bind++,quickhash.isEmpty() ? QVariant() : QVariant(quickhash));
             if (!q.exec()) { error_=q.lastError().text(); db_.rollback(); return false; }
             q.finish();
         }
@@ -556,6 +1027,7 @@ struct GroupResult {
     std::vector<ImgMeta> images;
     std::vector<std::vector<int>> groups;
     std::shared_ptr<BKTree<BitHash>> tree;
+    std::shared_ptr<HashBandIndex<BitHash>> bandIndex;
     QString error;
     QString cacheWarning;
     HashAlgo algo=HashAlgo::MD5;
@@ -565,8 +1037,328 @@ struct GroupResult {
 struct BulkDeleteResult {
     QStringList deleted;
     QStringList failed;
+    QStringList verificationFailed;
     bool cancelled=false;
 };
+
+struct ExactDeleteCandidate {
+    QString keeper;
+    QString target;
+};
+
+HashAlgo algorithmFromName(QString name,bool* ok=nullptr) {
+    name=name.trimmed().toLower();
+    const std::array<std::pair<const char*,HashAlgo>,10> names{{
+        {"md5",HashAlgo::MD5},{"exact",HashAlgo::MD5},
+        {"dhash",HashAlgo::DHash},{"phash",HashAlgo::PHash},
+        {"ahash",HashAlgo::AHash},{"whash",HashAlgo::WHash},
+        {"bhash",HashAlgo::BHash},{"difference",HashAlgo::DHash},
+        {"perceptual",HashAlgo::PHash},{"average",HashAlgo::AHash}}};
+    for (const auto& item:names) if (name==QLatin1String(item.first)) {
+        if (ok) *ok=true;
+        return item.second;
+    }
+    if (ok) *ok=false;
+    return HashAlgo::MD5;
+}
+
+quint64 processPeakMemory() {
+#ifdef Q_OS_WIN
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(),&counters,sizeof(counters)))
+        return quint64(counters.PeakWorkingSetSize);
+#endif
+    return 0;
+}
+
+int runBenchmark(const QStringList& arguments) {
+    auto option=[&](const QString& name,const QString& fallback=QString()) {
+        const int index=arguments.indexOf(name);
+        return index>=0 && index+1<arguments.size() ? arguments[index+1] : fallback;
+    };
+    const int benchmarkIndex=arguments.indexOf(QStringLiteral("--benchmark"));
+    const QString rootPath=benchmarkIndex>=0 && benchmarkIndex+1<arguments.size()
+        ? QDir(arguments[benchmarkIndex+1]).absolutePath() : QString();
+    bool algorithmOk=false;
+    const HashAlgo algorithm=algorithmFromName(option(QStringLiteral("--algorithm"),QStringLiteral("md5")),&algorithmOk);
+    const QString outputPath=QFileInfo(option(QStringLiteral("--output"),
+        QDir::current().absoluteFilePath(QStringLiteral("dupegem-benchmark.json")))).absoluteFilePath();
+    const bool selectedOnly=arguments.contains(QStringLiteral("--selected-only"));
+    bool cancelOk=false;
+    const int cancelAfter=option(QStringLiteral("--cancel-after"),QStringLiteral("0")).toInt(&cancelOk);
+    if (rootPath.isEmpty() || !QDir(rootPath).exists() || !algorithmOk) return 2;
+
+    QElapsedTimer totalTimer; totalTimer.start();
+    QElapsedTimer stage;
+    qint64 enumerationMs=0,cacheLookupNs=0,decodeHashMs=0,cacheWriteMs=0;
+    qint64 indexBuildMs=0,groupQueryMs=0,bytesRead=0;
+    int cacheHits=0,hardlinksSkipped=0;
+    QHash<QString,qint64> formatNs;
+    QHash<QString,int> formatCounts;
+    std::vector<ImgMeta> files;
+    std::vector<int> renamedRows;
+    QSet<QByteArray> identities;
+    QSet<QString> imageTypes;
+    for (const QString& extension:supportedImageExtensions()) imageTypes.insert(extension.toLower());
+    SqliteCache cache(QDir(rootPath).absoluteFilePath(QStringLiteral(".dupegem_cache.sqlite")));
+    const bool trackScan=cache.beginScanTracking();
+    QStringList seenBatch;
+    seenBatch.reserve(1000);
+    const QDir root(rootPath);
+
+    stage.start();
+    std::atomic<bool> benchmarkCancelled{false};
+    BoundedQueue<QString> discoveredPaths(4096);
+    std::thread enumerator([&] {
+        enumerateFilesParallel(rootPath,QStringList{QStringLiteral("*")},true,
+                               directoryWorkerCount(rootPath),benchmarkCancelled,discoveredPaths);
+    });
+    QString path;
+    while (discoveredPaths.pop(path)) {
+        const QFileInfo info(path);
+        if (info.fileName().startsWith(QStringLiteral(".dupegem_cache."),Qt::CaseInsensitive)) continue;
+        if (algorithm!=HashAlgo::MD5 && !imageTypes.contains(info.suffix().toLower())) continue;
+        const QString relative=root.relativeFilePath(path);
+        if (trackScan) {
+            seenBatch << relative;
+            if (seenBatch.size()>=1000) { cache.markSeen(seenBatch); seenBatch.clear(); }
+        }
+        const QByteArray identity=fileIdentity(path).cacheKey();
+        if (!identity.isEmpty() && identities.contains(identity)) { ++hardlinksSkipped; continue; }
+        if (!identity.isEmpty()) identities.insert(identity);
+        ImgMeta metadata;
+        QString stored;
+        const auto lookupStart=std::chrono::steady_clock::now();
+        const bool found=cache.find(relative,identity,metadata,&stored);
+        cacheLookupNs+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-lookupStart).count();
+        const qint64 mtime=info.lastModified().toMSecsSinceEpoch();
+        const bool renamed=found && !stored.isEmpty() && stored!=relative;
+        if (found && metadata.mtime==mtime && metadata.size==info.size()) ++cacheHits;
+        else metadata=ImgMeta{};
+        metadata.file=path; metadata.size=info.size(); metadata.mtime=mtime;
+        metadata.fileIdentity=identity; metadata.valid=true;
+        files.push_back(std::move(metadata));
+        if (renamed) renamedRows.push_back(int(files.size())-1);
+    }
+    enumerator.join();
+    if (trackScan && !seenBatch.isEmpty()) cache.markSeen(seenBatch);
+    enumerationMs=stage.elapsed();
+    std::sort(files.begin(),files.end(),[](const ImgMeta& left,const ImgMeta& right){
+        return QString::compare(left.file,right.file,Qt::CaseInsensitive)<0;
+    });
+
+    std::vector<int> changed=std::move(renamedRows);
+    std::atomic<int> benchmarkOperations{0};
+    auto noteOperation=[&] {
+        const int completed=++benchmarkOperations;
+        if (cancelOk && cancelAfter>0 && completed>=cancelAfter) benchmarkCancelled=true;
+    };
+    stage.restart();
+    if (algorithm==HashAlgo::MD5) {
+        QHash<qint64,QVector<int>> sizes;
+        for (int i=0;i<int(files.size());++i) sizes[files[size_t(i)].size].push_back(i);
+        std::vector<int> quick;
+        for (auto bucket=sizes.cbegin();bucket!=sizes.cend();++bucket)
+            if (bucket.value().size()>1) for (int index:bucket.value())
+                if (!files[size_t(index)].quickValid) quick.push_back(index);
+        std::mutex byteMutex;
+        runPersistentPipeline(quick.size(),exactWorkerCount(rootPath),benchmarkCancelled,
+            [&](size_t position) {
+                const int index=quick[position];
+                const ExactHashResult result=quickSampleFile(files[size_t(index)].file);
+                if (!result.ok) return -1;
+                files[size_t(index)].quickHash=result.sampleHash;
+                files[size_t(index)].quickValid=true;
+                { std::lock_guard<std::mutex> lock(byteMutex); bytesRead+=result.bytesRead; }
+                noteOperation();
+                return index;
+            },[&](const std::vector<int>& rows){changed.insert(changed.end(),rows.begin(),rows.end());});
+        std::vector<int> samples;
+        for (auto bucket=sizes.cbegin();bucket!=sizes.cend();++bucket) {
+            QHash<quint64,QVector<int>> quickGroups;
+            for (int index:bucket.value()) if (files[size_t(index)].quickValid)
+                quickGroups[files[size_t(index)].quickHash].push_back(index);
+            for (auto group=quickGroups.cbegin();group!=quickGroups.cend();++group)
+                if (group.value().size()>1) for (int index:group.value())
+                    if (!files[size_t(index)].sampleValid) samples.push_back(index);
+        }
+        runPersistentPipeline(samples.size(),exactWorkerCount(rootPath),benchmarkCancelled,
+            [&](size_t position) {
+                const int index=samples[position];
+                const ExactHashResult result=sampleFile(files[size_t(index)].file);
+                if (!result.ok) return -1;
+                files[size_t(index)].sampleHash=result.sampleHash;
+                files[size_t(index)].sampleValid=true;
+                { std::lock_guard<std::mutex> lock(byteMutex); bytesRead+=result.bytesRead; }
+                noteOperation();
+                return index;
+            },[&](const std::vector<int>& rows){changed.insert(changed.end(),rows.begin(),rows.end());});
+        std::vector<int> full;
+        for (auto bucket=sizes.cbegin();bucket!=sizes.cend();++bucket) {
+            QHash<QByteArray,QVector<int>> prehashes;
+            for (int index:bucket.value()) if (files[size_t(index)].quickValid
+                                                && files[size_t(index)].sampleValid) {
+                QByteArray key(16,Qt::Uninitialized);
+                std::memcpy(key.data(),&files[size_t(index)].quickHash,8);
+                std::memcpy(key.data()+8,&files[size_t(index)].sampleHash,8);
+                prehashes[key].push_back(index);
+            }
+            for (auto prehash=prehashes.cbegin();prehash!=prehashes.cend();++prehash)
+                if (prehash.value().size()>1) for (int index:prehash.value())
+                    if (files[size_t(index)].blake3.size()!=kBlake3DigestBytes) full.push_back(index);
+        }
+        runPersistentPipeline(full.size(),exactWorkerCount(rootPath),benchmarkCancelled,
+            [&](size_t position) {
+                const int index=full[position];
+                const ExactHashResult result=hashFileBlake3(files[size_t(index)].file);
+                if (!result.ok) return -1;
+                files[size_t(index)].blake3=result.blake3;
+                { std::lock_guard<std::mutex> lock(byteMutex); bytesRead+=result.bytesRead; }
+                noteOperation();
+                return index;
+            },[&](const std::vector<int>& rows){changed.insert(changed.end(),rows.begin(),rows.end());});
+    } else {
+        std::vector<int> pending;
+        for (int i=0;i<int(files.size());++i) {
+            const bool missing=selectedOnly ? !hasHash(files[size_t(i)],algorithm)
+                : (files[size_t(i)].hashMask&kAllPerceptualHashes)!=kAllPerceptualHashes;
+            if (missing) pending.push_back(i);
+        }
+        std::mutex statsMutex;
+        runPersistentPipeline(pending.size(),decoderWorkerCount(rootPath),benchmarkCancelled,
+            [&](size_t position) {
+                const int index=pending[position];
+                const QString suffix=QFileInfo(files[size_t(index)].file).suffix().toLower();
+                const auto started=std::chrono::steady_clock::now();
+                const bool ok=readAndHash(files[size_t(index)],algorithm,!selectedOnly);
+                const qint64 elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now()-started).count();
+                std::lock_guard<std::mutex> lock(statsMutex);
+                formatNs[suffix]+=elapsed; ++formatCounts[suffix];
+                bytesRead+=files[size_t(index)].size;
+                noteOperation();
+                return ok ? index : -1;
+            },[&](const std::vector<int>& rows){changed.insert(changed.end(),rows.begin(),rows.end());});
+    }
+    decodeHashMs=stage.elapsed();
+
+    std::sort(changed.begin(),changed.end());
+    changed.erase(std::unique(changed.begin(),changed.end()),changed.end());
+    stage.restart();
+    if (!changed.empty()) cache.saveRows(rootPath,files,changed);
+    if (trackScan) cache.removeMissingUnseen(rootPath);
+    cacheWriteMs=stage.elapsed();
+
+    int groupCount=0;
+    if (!benchmarkCancelled && algorithm==HashAlgo::MD5) {
+        QHash<QByteArray,int> counts;
+        for (const ImgMeta& file:files) if (file.blake3.size()==kBlake3DigestBytes) {
+            QByteArray key(sizeof(qint64),Qt::Uninitialized);
+            std::memcpy(key.data(),&file.size,sizeof(file.size));
+            key+=file.blake3;
+            ++counts[key];
+        }
+        for (auto count=counts.cbegin();count!=counts.cend();++count) if (count.value()>1) ++groupCount;
+    } else if (!benchmarkCancelled) {
+        stage.restart();
+        const bool useBands=files.size()>=50000
+            && std::all_of(files.begin(),files.end(),[&](const ImgMeta& file){return hasHash(file,algorithm);});
+        BKTree<BitHash> tree;
+        HashBandIndex<BitHash> bands;
+        if (useBands) {
+            std::vector<BitHash> hashes;
+            hashes.reserve(files.size());
+            for (const ImgMeta& file:files) hashes.push_back(pickHash(file,algorithm));
+            bands.build(hashes,workerCount());
+        } else {
+            tree.reserve(files.size());
+            for (int i=0;i<int(files.size());++i)
+                if (hasHash(files[size_t(i)],algorithm)) tree.add(pickHash(files[size_t(i)],algorithm),i);
+        }
+        indexBuildMs=stage.elapsed();
+        stage.restart();
+        std::vector<bool> assigned(files.size(),false);
+        for (int i=0;i<int(files.size());++i) if (!assigned[size_t(i)] && hasHash(files[size_t(i)],algorithm)) {
+            assigned[size_t(i)]=true; int members=1;
+            const std::vector<int> hits=useBands
+                ? bands.query(pickHash(files[size_t(i)],algorithm),4,i)
+                : tree.query(pickHash(files[size_t(i)],algorithm),4,i);
+            for (int hit:hits)
+                if (!assigned[size_t(hit)]) { assigned[size_t(hit)]=true; ++members; }
+            if (members>1) ++groupCount;
+        }
+        groupQueryMs=stage.elapsed();
+    }
+
+    const qint64 coreTotalMs=totalTimer.elapsed();
+    int jpegSamples=0;
+    qint64 qtJpegNs=0,turboJpegNs=0;
+    for (const ImgMeta& file:files) {
+        if (benchmarkCancelled) break;
+        const QString suffix=QFileInfo(file.file).suffix().toLower();
+        if (suffix!=QStringLiteral("jpg") && suffix!=QStringLiteral("jpeg")
+            && suffix!=QStringLiteral("jfif")) continue;
+        const auto qtStart=std::chrono::steady_clock::now();
+        const QImage qtImage=decodeImage(file.file,QSize(64,64),Qt::IgnoreAspectRatio);
+        qtJpegNs+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-qtStart).count();
+        const auto turboStart=std::chrono::steady_clock::now();
+        const QImage turboImage=decodeHashImage(file.file,QSize(64,64));
+        turboJpegNs+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-turboStart).count();
+        if (!qtImage.isNull() && !turboImage.isNull()) ++jpegSamples;
+        if (jpegSamples>=100) break;
+    }
+
+    QJsonArray formats;
+    for (auto it=formatCounts.cbegin();it!=formatCounts.cend();++it) {
+        QJsonObject entry; entry[QStringLiteral("extension")]=it.key();
+        entry[QStringLiteral("files")]=it.value();
+        entry[QStringLiteral("decode_hash_ms")]=double(formatNs.value(it.key()))/1.0e6;
+        formats.append(entry);
+    }
+    QJsonObject result;
+    result[QStringLiteral("root")]=QDir::toNativeSeparators(rootPath);
+    result[QStringLiteral("algorithm")]=QString::fromLatin1(algoName(algorithm));
+    result[QStringLiteral("mode")]=algorithm==HashAlgo::MD5 ? QStringLiteral("exact")
+        : (selectedOnly?QStringLiteral("selected-only"):QStringLiteral("all-perceptual-hashes"));
+    result[QStringLiteral("files")]=int(files.size());
+    result[QStringLiteral("groups")]=groupCount;
+    result[QStringLiteral("enumeration_ms")]=double(enumerationMs);
+    result[QStringLiteral("cache_lookup_ms")]=double(cacheLookupNs)/1.0e6;
+    result[QStringLiteral("decode_hash_ms")]=double(decodeHashMs);
+    result[QStringLiteral("sqlite_write_ms")]=double(cacheWriteMs);
+    result[QStringLiteral("index_build_ms")]=double(indexBuildMs);
+    result[QStringLiteral("group_query_ms")]=double(groupQueryMs);
+    result[QStringLiteral("bytes_read")]=double(bytesRead);
+    result[QStringLiteral("peak_memory_bytes")]=double(processPeakMemory());
+    result[QStringLiteral("cache_hits")]=cacheHits;
+    result[QStringLiteral("cache_hit_rate")]=files.empty()?0.0:double(cacheHits)/files.size();
+    result[QStringLiteral("hardlinks_skipped")]=hardlinksSkipped;
+    result[QStringLiteral("cancelled")]=benchmarkCancelled.load();
+    result[QStringLiteral("completed_operations")]=benchmarkOperations.load();
+    QString journalError;
+    const NtfsJournalCursor journalCursor=currentNtfsJournal(rootPath,&journalError);
+    result[QStringLiteral("ntfs_journal_available")]=journalCursor.isValid();
+    if (!journalError.isEmpty()) result[QStringLiteral("ntfs_journal_error")]=journalError;
+    result[QStringLiteral("total_ms")]=double(coreTotalMs);
+    result[QStringLiteral("files_per_second")]=coreTotalMs>0
+        ? double(files.size())*1000.0/coreTotalMs:0.0;
+    result[QStringLiteral("formats")]=formats;
+    QJsonObject jpegComparison;
+    jpegComparison[QStringLiteral("samples")]=jpegSamples;
+    jpegComparison[QStringLiteral("qt_scaled_decode_ms")]=double(qtJpegNs)/1.0e6;
+    jpegComparison[QStringLiteral("turbojpeg_grayscale_ms")]=double(turboJpegNs)/1.0e6;
+    jpegComparison[QStringLiteral("turbojpeg_speedup")]=turboJpegNs>0
+        ? double(qtJpegNs)/double(turboJpegNs):0.0;
+    result[QStringLiteral("jpeg_decoder_comparison")]=jpegComparison;
+
+    QSaveFile output(outputPath);
+    if (!output.open(QIODevice::WriteOnly)) return 3;
+    output.write(QJsonDocument(result).toJson(QJsonDocument::Indented));
+    return output.commit()?0:3;
+}
 
 // ---------- FlowLayout (image grid layout) ----------
 
@@ -687,8 +1479,8 @@ public:
 
         QString similarity=QStringLiteral("—");
         if (meta_.file==leader_.file) similarity=QStringLiteral("100% • representative");
-        else if (activeAlgo_==HashAlgo::MD5 && !meta_.md5.isEmpty() && !leader_.md5.isEmpty())
-            similarity=(meta_.md5==leader_.md5) ? QStringLiteral("100% • exact") : QStringLiteral("0%");
+        else if (activeAlgo_==HashAlgo::MD5 && !meta_.blake3.isEmpty() && !leader_.blake3.isEmpty())
+            similarity=(meta_.blake3==leader_.blake3) ? QStringLiteral("100% • exact hash") : QStringLiteral("0%");
         else if (hasHash(meta_,activeAlgo_) && hasHash(leader_,activeAlgo_))
             similarity=QStringLiteral("%1% similar").arg(100-(hamming(pickHash(meta_,activeAlgo_),pickHash(leader_,activeAlgo_))*100/kHashBits));
 
@@ -880,7 +1672,7 @@ public:
             md5Other_  = new QCheckBox(QStringLiteral("Other"));
             md5Images_->setChecked(true);
             const QString tip=QStringLiteral(
-                "Choose which file categories Exact MD5 scans. Any combination is allowed.");
+                "Choose which file categories Exact Files scans. Any combination is allowed.");
             for (QCheckBox* box:{md5Images_,md5Videos_,md5Other_}) box->setToolTip(tip);
             md5Other_->setToolTip(QStringLiteral(
                 "Files that are neither recognized images nor common video formats. DupeGem cache files are excluded."));
@@ -909,8 +1701,13 @@ public:
         {
             auto* row = new QHBoxLayout;
             btnRegroup_ = new QPushButton(QStringLiteral("Rescan/Regroup Images"));
+            cacheAllHashes_ = new QCheckBox(QStringLiteral("Cache all hashes"));
+            cacheAllHashes_->setChecked(true);
+            cacheAllHashes_->setToolTip(QStringLiteral(
+                "Decode once and save all five perceptual hashes. Disable for selected-only low-power mode."));
             showSingles_ = new QCheckBox(QStringLiteral("Show Singles"));
             row->addWidget(btnRegroup_, 1);
+            row->addWidget(cacheAllHashes_, 0);
             row->addWidget(showSingles_, 0);
             ctl->addLayout(row);
         }
@@ -959,7 +1756,7 @@ public:
     btnDeleteAllGroups_ = new QPushButton(QStringLiteral("Delete From All Groups…"));
     btnDeleteAllGroups_->setObjectName(QStringLiteral("secondaryDangerButton"));
     btnDeleteAllGroups_->setToolTip(QStringLiteral(
-        "MD5 only: keep one file in every exact-match group and move the rest to the Recycle Bin."));
+        "Exact Files only: verify candidates byte-for-byte, keep one file in each group, and recycle the rest."));
     btnDeleteAllGroups_->setFont(df);
     btnDeleteAllGroups_->setMinimumHeight(btnDelete_->minimumHeight());
     btnDeleteAllGroups_->setVisible(false);
@@ -1145,6 +1942,10 @@ connect(scBksp, &QShortcut::activated, this, [this]{
         connect(md5Images_,&QCheckBox::toggled,this,categoryChanged);
         connect(md5Videos_,&QCheckBox::toggled,this,categoryChanged);
         connect(md5Other_, &QCheckBox::toggled,this,categoryChanged);
+        connect(cacheAllHashes_,&QCheckBox::toggled,this,[this](bool){
+            if (currentAlgorithm()!=HashAlgo::MD5 && !currentDir_.isEmpty() && !busy_.load())
+                startScan(currentDir_);
+        });
         connect(showSingles_, &QCheckBox::toggled, this, &DupeGemMainWindow::regroup);
         connect(thrSlider_,   &QSlider::valueChanged, this, &DupeGemMainWindow::updateThrLabel);
         connect(sizeSlider_,  &QSlider::valueChanged, this, [this](int v){
@@ -1213,7 +2014,7 @@ private:
 
         clearThumbs();
         currentGroup_ = -1;
-        images_.clear(); groups_.clear(); trees_.clear(); groupsList_->clear(); groupIdxSorted_.clear();
+        images_.clear(); groups_.clear(); trees_.clear(); bandIndices_.clear(); groupsList_->clear(); groupIdxSorted_.clear();
         setInteractive(false);
         prog_->setRange(0,0); prog_->setVisible(true);
         statusTxt_->setText(QStringLiteral("Enumerating files..."));
@@ -1222,6 +2023,7 @@ private:
         const bool includeImages=algo!=HashAlgo::MD5 || md5Images_->isChecked();
         const bool includeVideos=algo==HashAlgo::MD5 && md5Videos_->isChecked();
         const bool includeOther =algo==HashAlgo::MD5 && md5Other_->isChecked();
+        const bool calculateAll=algo!=HashAlgo::MD5 && cacheAllHashes_->isChecked();
         QSet<QString> imageTypes, videoTypes;
         for (const QString& extension:supportedImageExtensions()) imageTypes.insert(extension.toLower());
         for (const QString& extension:supportedVideoExtensions()) videoTypes.insert(extension.toLower());
@@ -1238,6 +2040,11 @@ private:
         if (filters.isEmpty()) filters << QStringLiteral("__dupegem_no_selected_file_types__");
         filters.removeDuplicates();
         const bool recurse=scanSubs_->isChecked();
+        const QByteArray scanScope=QStringLiteral("v1|%1|%2|%3%4%5")
+            .arg(recurse?1:0)
+            .arg(algo==HashAlgo::MD5?QStringLiteral("exact"):QStringLiteral("images"))
+            .arg(includeImages?1:0).arg(includeVideos?1:0).arg(includeOther?1:0)
+            .toUtf8();
         const QString cachePath=cacheFile_;
         QPointer<DupeGemMainWindow> self(this);
         auto post=[self](const QString& text,int value=-1,int maximum=-1){
@@ -1271,93 +2078,229 @@ private:
             startGrouping();
         });
 
-        watcher->setFuture(QtConcurrent::run([dir,cachePath,filters,recurse,algo,post,this,
+        watcher->setFuture(QtConcurrent::run([dir,cachePath,filters,recurse,algo,post,this,calculateAll,scanScope,
                                                imageTypes,videoTypes,includeImages,includeVideos,includeOther]{
             ScanResult out;
             try {
                 SqliteCache cache(cachePath);
-                QHash<QString,ImgMeta> cached=cache.loadAll();
+                NtfsJournalCursor scanCursor=currentNtfsJournal(dir);
+                NtfsChangeSet journalChanges;
+                bool journalFastPath=false;
+                if (cache.isOpen() && cache.meta(QStringLiteral("scan_scope"))==scanScope) {
+                    const NtfsJournalCursor previous=NtfsJournalCursor::deserialize(
+                        cache.meta(QStringLiteral("usn_cursor")));
+                    if (previous.isValid()) {
+                        journalChanges=readNtfsChanges(dir,previous);
+                        journalFastPath=journalChanges.complete && !journalChanges.requiresFullScan;
+                        if (journalChanges.cursor.isValid()) scanCursor=journalChanges.cursor;
+                    }
+                }
+                const bool trackFullScan=!journalFastPath && cache.beginScanTracking();
+                QStringList seenBatch;
+                seenBatch.reserve(1000);
                 if (!cache.isOpen()) out.cacheWarning=cache.error();
-                QStringList files;
-                const auto flags=recurse ? QDirIterator::Subdirectories : QDirIterator::NoIteratorFlags;
-                QDirIterator it(dir,filters,QDir::Files|QDir::Readable,flags);
-                while (it.hasNext()) {
-                    if (cancelled_) { out.cancelled=true; return out; }
-                    const QString path=it.next();
+                struct ScanWork { ImgMeta image; };
+                struct ScanCompletion { ImgMeta image; bool save{}; };
+                BoundedPriorityQueue<ScanWork> pendingQueue(size_t(decoderWorkerCount(dir)*8));
+                BoundedQueue<ScanCompletion> completedQueue(1024);
+                std::vector<ImgMeta> completed;
+                QString writerWarning;
+                std::atomic<int> hashed{0};
+
+                std::thread writer([&]{
+                    SqliteCache writerCache(cachePath);
+                    std::vector<ImgMeta> saveBatch;
+                    saveBatch.reserve(1000);
+                    auto flush=[&]{
+                        if (saveBatch.empty()) return;
+                        std::vector<int> rows(saveBatch.size());
+                        std::iota(rows.begin(),rows.end(),0);
+                        if (writerCache.isOpen() && !writerCache.saveRows(dir,saveBatch,rows))
+                            writerWarning=writerCache.error();
+                        else if (!writerCache.isOpen()) writerWarning=writerCache.error();
+                        saveBatch.clear();
+                    };
+                    ScanCompletion item;
+                    while (true) {
+                        const int state=completedQueue.popFor(item,std::chrono::seconds(2));
+                        if (state<0) break;
+                        if (state==0) { flush(); continue; }
+                        if (item.image.valid) {
+                            if (item.save) saveBatch.push_back(item.image);
+                            completed.push_back(std::move(item.image));
+                        }
+                        if (saveBatch.size()>=1000) flush();
+                    }
+                    flush();
+                });
+
+                const int decoders=algo==HashAlgo::MD5 ? 1 : decoderWorkerCount(dir);
+                std::vector<std::thread> workers;
+                workers.reserve(size_t(decoders));
+                for (int worker=0;worker<decoders;++worker) {
+                    workers.emplace_back([&]{
+                        ScanWork work;
+                        while (pendingQueue.pop(work)) {
+                            if (cancelled_) break;
+                            try {
+                                work.image.valid=readAndHash(work.image,algo,calculateAll);
+                            } catch (...) { work.image.valid=false; }
+                            const int done=++hashed;
+                            if ((done&63)==0)
+                                post(QStringLiteral("Pipelined hashing • %1 complete").arg(done));
+                            completedQueue.push({std::move(work.image),true});
+                        }
+                    });
+                }
+
+                QStringList replacedPaths;
+                QSet<QByteArray> identities;
+                const QDir root(dir);
+                int discovered=0;
+                auto withinRoot=[&](const QString& path) {
+                    const QString relative=root.relativeFilePath(path);
+                    if (QDir::isAbsolutePath(relative) || relative==QStringLiteral("..")
+                        || relative.startsWith(QStringLiteral("../"))) return false;
+                    return recurse || !relative.contains('/');
+                };
+                auto acceptedPath=[&](const QString& path) {
                     const QFileInfo candidate(path);
                     const QString name=candidate.fileName();
-                    if (name.startsWith(QStringLiteral(".dupegem_cache."),Qt::CaseInsensitive)) continue;
+                    if (name.startsWith(QStringLiteral(".dupegem_cache."),Qt::CaseInsensitive)) return false;
                     const QString suffix=candidate.suffix().toLower();
                     const bool image=imageTypes.contains(suffix);
                     const bool video=!image && videoTypes.contains(suffix);
-                    const bool accepted=algo!=HashAlgo::MD5 ? image
+                    return algo!=HashAlgo::MD5 ? image
                         : (image ? includeImages : (video ? includeVideos : includeOther));
-                    if (!accepted) continue;
-                    files<<path;
-                    if ((files.size()&2047)==0)
+                };
+                auto decodePriority=[](const ImgMeta& metadata) {
+                    int priority=1000-int(std::min<qint64>(500,metadata.size/(1024*1024)));
+                    const QString suffix=QFileInfo(metadata.file).suffix().toLower();
+                    if (suffix==QStringLiteral("jpg") || suffix==QStringLiteral("jpeg")
+                        || suffix==QStringLiteral("jfif")) priority+=400;
+                    else if (isSupportedHeifFile(metadata.file)) priority+=100;
+                    else if (isSupportedRawFile(metadata.file)) priority-=500;
+                    return priority;
+                };
+                auto enqueue=[&](ImgMeta metadata,bool metadataHit,bool renamed) {
+                    if (metadataHit) ++out.cacheHits;
+                    const bool missing=calculateAll
+                        ? (metadata.hashMask & kAllPerceptualHashes)!=kAllPerceptualHashes
+                        : !hasHash(metadata,algo);
+                    const bool needsHash=algo!=HashAlgo::MD5 && missing;
+                    const bool needsSave=!metadataHit || renamed || needsHash;
+                    if (needsHash) {
+                        const int priority=decodePriority(metadata)+(metadataHit?100:0);
+                        pendingQueue.push({std::move(metadata)},priority,cancelled_);
+                    }
+                    else completedQueue.push({std::move(metadata),needsSave});
+                    ++discovered;
+                    if ((discovered&2047)==0)
                         post(QStringLiteral("Discovering %1... %2")
                             .arg(algo==HashAlgo::MD5 ? QStringLiteral("files") : QStringLiteral("images"))
-                            .arg(files.size()));
+                            .arg(discovered));
+                };
+                auto processPath=[&](const QString& path,qint64 fileUsn,bool contentChanged) {
+                    if (path.isEmpty() || !withinRoot(path) || !acceptedPath(path)) return;
+                    const QFileInfo candidate(path);
+                    if (!candidate.isFile() || !candidate.isReadable()) return;
+                    const QByteArray identity=fileIdentity(path).cacheKey();
+                    if (!identity.isEmpty()) {
+                        if (identities.contains(identity)) return;
+                        identities.insert(identity);
+                    }
+
+                    const QString relative=root.relativeFilePath(path);
+                    if (trackFullScan) {
+                        seenBatch << relative;
+                        if (seenBatch.size()>=1000) {
+                            if (!cache.markSeen(seenBatch)) out.cacheWarning=cache.error();
+                            seenBatch.clear();
+                        }
+                    }
+                    ImgMeta metadata;
+                    QString storedPath;
+                    const bool found=cache.find(relative,identity,metadata,&storedPath);
+                    const qint64 mtime=candidate.lastModified().toMSecsSinceEpoch();
+                    const bool metadataHit=found && metadata.mtime==mtime
+                        && metadata.size==candidate.size() && !contentChanged;
+                    if (!metadataHit) metadata=ImgMeta{};
+                    metadata.file=path;
+                    metadata.size=candidate.size();
+                    metadata.mtime=mtime;
+                    metadata.fileUsn=fileUsn;
+                    metadata.valid=true;
+                    metadata.fileIdentity=identity;
+                    const bool renamed=found && !storedPath.isEmpty() && storedPath!=relative;
+                    if (renamed) replacedPaths << storedPath;
+                    enqueue(std::move(metadata),metadataHit,renamed);
+                };
+
+                if (journalFastPath) {
+                    post(QStringLiteral("Applying %1 NTFS journal changes...")
+                         .arg(journalChanges.changes.size()));
+                    QHash<QByteArray,NtfsChange> changes;
+                    for (NtfsChange& change:journalChanges.changes)
+                        changes.insert(change.fileIdentity,std::move(change));
+                    std::vector<ImgMeta> cached=cache.loadAllRows(dir);
+                    for (ImgMeta& metadata:cached) {
+                        if (cancelled_) break;
+                        const auto changed=changes.find(metadata.fileIdentity);
+                        if (changed!=changes.end()) {
+                            const NtfsChange change=changed.value();
+                            changes.erase(changed);
+                            if (change.deleted || !withinRoot(change.currentPath))
+                                replacedPaths << root.relativeFilePath(metadata.file);
+                            if (!change.deleted)
+                                processPath(change.currentPath,change.usn,change.contentChanged);
+                            continue;
+                        }
+                        if (!withinRoot(metadata.file) || !acceptedPath(metadata.file)) continue;
+                        if (!metadata.fileIdentity.isEmpty()) {
+                            if (identities.contains(metadata.fileIdentity)) continue;
+                            identities.insert(metadata.fileIdentity);
+                        }
+                        enqueue(std::move(metadata),true,false);
+                    }
+                    for (auto change=changes.cbegin();change!=changes.cend();++change)
+                        if (!change->deleted)
+                            processPath(change->currentPath,change->usn,change->contentChanged);
+                } else {
+                    BoundedQueue<QString> discoveredPaths(4096);
+                    std::thread enumerator([&] {
+                        enumerateFilesParallel(dir,filters,recurse,directoryWorkerCount(dir),
+                                               cancelled_,discoveredPaths);
+                    });
+                    QString path;
+                    while (discoveredPaths.pop(path))
+                        if (!cancelled_) processPath(path,0,false);
+                    enumerator.join();
                 }
-                std::sort(files.begin(),files.end(),[](const QString& a,const QString& b){
-                    return QString::compare(a,b,Qt::CaseInsensitive)<0;
+
+                if (trackFullScan && !seenBatch.isEmpty()) {
+                    if (!cache.markSeen(seenBatch)) out.cacheWarning=cache.error();
+                    seenBatch.clear();
+                }
+
+                pendingQueue.close();
+                for (auto& worker:workers) worker.join();
+                completedQueue.close();
+                writer.join();
+                out.discovered=discovered;
+                out.images=std::move(completed);
+                std::sort(out.images.begin(),out.images.end(),[](const ImgMeta& left,const ImgMeta& right){
+                    return QString::compare(left.file,right.file,Qt::CaseInsensitive)<0;
                 });
-                out.discovered=files.size();
-                out.images.resize(size_t(files.size()));
-                std::vector<int> pending; pending.reserve(files.size());
-                const QDir root(dir);
-                for (qsizetype i=0;i<files.size();++i) {
-                    QFileInfo fi(files[i]);
-                    const QString rel=root.relativeFilePath(files[i]);
-                    auto found=cached.find(rel);
-                    ImgMeta m;
-                    if (found!=cached.end() && found->mtime==fi.lastModified().toMSecsSinceEpoch() && found->size==fi.size()) {
-                        m=*found; ++out.cacheHits;
-                    }
-                    if (found!=cached.end()) cached.erase(found);
-                    m.file=files[i]; m.size=fi.size(); m.mtime=fi.lastModified().toMSecsSinceEpoch(); m.valid=true;
-                    out.images[size_t(i)]=std::move(m);
-                    if (algo!=HashAlgo::MD5 && !hasHash(out.images[size_t(i)],algo)) pending.push_back(int(i));
+                if (!writerWarning.isEmpty()) out.cacheWarning=writerWarning;
+                if (cache.isOpen() && !replacedPaths.isEmpty()) cache.removePaths(replacedPaths);
+                if (trackFullScan && cache.isOpen() && !cache.removeMissingUnseen(dir))
+                    out.cacheWarning=cache.error();
+                if (cache.isOpen() && scanCursor.isValid() && !cancelled_) {
+                    if (!cache.setMeta(QStringLiteral("usn_cursor"),scanCursor.serialize())
+                        || !cache.setMeta(QStringLiteral("scan_scope"),scanScope))
+                        out.cacheWarning=cache.error();
                 }
-                post(QStringLiteral("Preparing %1 %2...").arg(files.size())
-                    .arg(algo==HashAlgo::MD5 ? QStringLiteral("files") : QStringLiteral("images")),0,int(pending.size()));
-                QThreadPool pool; pool.setMaxThreadCount(workerCount());
-                std::atomic<int> done{0};
-                int checkpointed=0;
-                constexpr size_t checkpointSize=1000;
-                for (size_t base=0;base<pending.size();base+=checkpointSize) {
-                    const size_t end=std::min(base+checkpointSize,pending.size());
-                    std::vector<char> completed(end-base,0);
-                    for (size_t pos=base;pos<end;++pos) {
-                        const int idx=pending[pos];
-                        pool.start(new FunctionTask([&,idx,pos,base]{
-                            if (!cancelled_) {
-                                try { out.images[size_t(idx)].valid=readAndHash(out.images[size_t(idx)],algo); }
-                                catch (...) { out.images[size_t(idx)].valid=false; }
-                                completed[pos-base]=1;
-                            }
-                            const int d=++done;
-                            if ((d&63)==0 || d==int(pending.size()))
-                                post(QStringLiteral("Hashing %1 • %2 / %3").arg(QString::fromLatin1(algoName(algo))).arg(d).arg(pending.size()),d,int(pending.size()));
-                        }));
-                    }
-                    pool.waitForDone();
-                    std::vector<int> checkpoint;
-                    checkpoint.reserve(end-base);
-                    for (size_t pos=base;pos<end;++pos)
-                        if (completed[pos-base] && out.images[size_t(pending[pos])].valid) checkpoint.push_back(pending[pos]);
-                    if (cache.isOpen() && !checkpoint.empty() && !cache.saveRows(dir,out.images,checkpoint)) out.cacheWarning=cache.error();
-                    checkpointed+=int(checkpoint.size());
-                    if (!checkpoint.empty()) post(QStringLiteral("Saved checkpoint • %1 hashes retained").arg(checkpointed),done.load(),int(pending.size()));
-                    if (cancelled_) { out.cancelled=true; return out; }
-                }
-                out.images.erase(std::remove_if(out.images.begin(),out.images.end(),[](const ImgMeta& m){return !m.valid;}),out.images.end());
-                if (cache.isOpen() && !cached.isEmpty()) {
-                    QStringList missing;
-                    for (auto it=cached.cbegin();it!=cached.cend();++it)
-                        if (!QFileInfo::exists(root.absoluteFilePath(it.key()))) missing << it.key();
-                    if (!missing.isEmpty() && !cache.removePaths(missing)) out.cacheWarning=cache.error();
-                }
+                if (cancelled_) { out.cancelled=true; return out; }
             } catch (const std::exception& e) { out.error=QString::fromLocal8Bit(e.what()); }
             catch (...) { out.error=QStringLiteral("Unknown background scan failure."); }
             return out;
@@ -1369,7 +2312,7 @@ private:
         if (images_.empty()) {
             busy_=false; prog_->setVisible(false); setInteractive(true);
             headerLabel_->setText(algo==HashAlgo::MD5
-                ? QStringLiteral("No files match the selected MD5 categories.")
+                ? QStringLiteral("No files match the selected Exact Files categories.")
                 : QStringLiteral("No readable images found."));
             libraryStats_->setText(QStringLiteral("0 %1").arg(
                 algo==HashAlgo::MD5 ? QStringLiteral("files") : QStringLiteral("images")));
@@ -1380,9 +2323,16 @@ private:
         prog_->setVisible(true); prog_->setRange(0,0);
         const int threshold=thrSlider_->value();
         const bool showSingles=showSingles_->isChecked();
+        const bool calculateAll=algo!=HashAlgo::MD5 && cacheAllHashes_->isChecked();
         const QString root=currentDir_, cachePath=cacheFile_;
         std::shared_ptr<BKTree<BitHash>> existing;
+        std::shared_ptr<HashBandIndex<BitHash>> existingBands;
+        const bool useBandIndex=images_.size()>=50000
+            && threshold<=HashBandIndex<BitHash>::kMaximumExactDistance;
         auto treeIt=trees_.find(algo); if (treeIt!=trees_.end()) existing=treeIt->second;
+        auto bandIt=bandIndices_.find(algo);
+        if (bandIt!=bandIndices_.end()) existingBands=bandIt->second;
+        if (useBandIndex) existing.reset(); else existingBands.reset();
         auto work=std::move(images_);
         QPointer<DupeGemMainWindow> self(this);
         auto post=[self](const QString& text,int value=-1,int maximum=-1){
@@ -1409,6 +2359,7 @@ private:
             }
             groups_=std::move(result.groups);
             if (result.tree) trees_[result.algo]=std::move(result.tree);
+            if (result.bandIndex) bandIndices_[result.algo]=std::move(result.bandIndex);
             prog_->setVisible(false); busy_=false; setInteractive(true);
             const bool exact=result.algo==HashAlgo::MD5;
             const QString noun=exact ? QStringLiteral("files") : QStringLiteral("images");
@@ -1423,11 +2374,10 @@ private:
             else { clearThumbs(); headerLabel_->setText(QStringLiteral("No duplicate groups for these settings.")); }
         });
 
-        watcher->setFuture(QtConcurrent::run([work=std::move(work),algo,threshold,showSingles,root,cachePath,existing,post,this]() mutable {
+        watcher->setFuture(QtConcurrent::run([work=std::move(work),algo,threshold,showSingles,calculateAll,useBandIndex,root,cachePath,existing,existingBands,post,this]() mutable {
             GroupResult out; out.images=std::move(work); out.algo=algo;
             try {
                 int n=int(out.images.size());
-                constexpr size_t checkpointSize=1000;
                 std::unique_ptr<SqliteCache> checkpointCache;
                 auto saveCheckpoint=[&](const std::vector<int>& rows){
                     if (rows.empty()) return;
@@ -1439,92 +2389,195 @@ private:
                 if (algo==HashAlgo::MD5) {
                     QHash<qint64,QVector<int>> bySize; bySize.reserve(n*2);
                     for (int i=0;i<n;++i) bySize[out.images[size_t(i)].size].push_back(i);
-                    std::vector<int> pending;
+                    std::vector<int> pendingQuick;
                     for (auto it=bySize.cbegin();it!=bySize.cend();++it)
-                        if (it.value().size()>1) for (int i:it.value()) if (out.images[size_t(i)].md5.isEmpty()) pending.push_back(i);
-                    post(QStringLiteral("Hashing exact size collisions..."),0,int(pending.size()));
-                    QThreadPool pool; pool.setMaxThreadCount(workerCount()); std::atomic<int> done{0};
-                    for (size_t base=0;base<pending.size();base+=checkpointSize) {
-                        const size_t end=std::min(base+checkpointSize,pending.size());
-                        std::vector<char> completed(end-base,0);
-                        for (size_t pos=base;pos<end;++pos) {
-                            const int idx=pending[pos];
-                            pool.start(new FunctionTask([&,idx,pos,base]{
-                                if (!cancelled_) {
-                                    out.images[size_t(idx)].md5=md5ForFile(out.images[size_t(idx)].file);
-                                    completed[pos-base]=1;
-                                }
-                                const int d=++done; if ((d&31)==0 || d==int(pending.size())) post(QStringLiteral("Exact hashing • %1 / %2").arg(d).arg(pending.size()),d,int(pending.size()));
-                            }));
+                        if (it.value().size()>1)
+                            for (int i:it.value())
+                                if (!out.images[size_t(i)].quickValid) pendingQuick.push_back(i);
+
+                    const int readers=exactWorkerCount(root);
+                    std::atomic<int> quickDone{0};
+                    post(QStringLiteral("Checking first and last 16 KiB with XXH3..."),0,int(pendingQuick.size()));
+                    runPersistentPipeline(pendingQuick.size(),readers,cancelled_,
+                        [&](size_t position) {
+                            const int index=pendingQuick[position];
+                            const ExactHashResult result=quickSampleFile(out.images[size_t(index)].file);
+                            if (result.ok) {
+                                out.images[size_t(index)].quickHash=result.sampleHash;
+                                out.images[size_t(index)].quickValid=true;
+                            }
+                            const int count=++quickDone;
+                            if ((count&31)==0 || count==int(pendingQuick.size()))
+                                post(QStringLiteral("XXH3 end samples • %1 / %2")
+                                     .arg(count).arg(pendingQuick.size()),count,int(pendingQuick.size()));
+                            return result.ok ? index : -1;
+                        },saveCheckpoint);
+                    if (cancelled_) { out.cancelled=true; return out; }
+
+                    std::vector<int> pendingSamples;
+                    for (auto sizeBucket=bySize.cbegin();sizeBucket!=bySize.cend();++sizeBucket) {
+                        QHash<quint64,QVector<int>> quickGroups;
+                        for (int index:sizeBucket.value()) if (out.images[size_t(index)].quickValid)
+                            quickGroups[out.images[size_t(index)].quickHash].push_back(index);
+                        for (auto group=quickGroups.cbegin();group!=quickGroups.cend();++group)
+                            if (group.value().size()>1) for (int index:group.value())
+                                if (!out.images[size_t(index)].sampleValid) pendingSamples.push_back(index);
+                    }
+                    std::atomic<int> sampled{0};
+                    post(QStringLiteral("Checking distributed 25/50/75% samples..."),0,int(pendingSamples.size()));
+                    runPersistentPipeline(pendingSamples.size(),readers,cancelled_,
+                        [&](size_t position) {
+                            const int index=pendingSamples[position];
+                            const ExactHashResult result=sampleFile(out.images[size_t(index)].file);
+                            if (result.ok) {
+                                out.images[size_t(index)].sampleHash=result.sampleHash;
+                                out.images[size_t(index)].sampleValid=true;
+                            }
+                            const int count=++sampled;
+                            if ((count&31)==0 || count==int(pendingSamples.size()))
+                                post(QStringLiteral("XXH3 distributed samples • %1 / %2")
+                                     .arg(count).arg(pendingSamples.size()),count,int(pendingSamples.size()));
+                            return result.ok ? index : -1;
+                        },saveCheckpoint);
+                    if (cancelled_) { out.cancelled=true; return out; }
+
+                    std::vector<int> pendingFull;
+                    for (auto sizeBucket=bySize.cbegin();sizeBucket!=bySize.cend();++sizeBucket) {
+                        if (sizeBucket.value().size()<2) continue;
+                        QHash<QByteArray,QVector<int>> samples;
+                        for (int index:sizeBucket.value()) {
+                            const ImgMeta& image=out.images[size_t(index)];
+                            if (image.quickValid && image.sampleValid) {
+                                QByteArray key(16,Qt::Uninitialized);
+                                std::memcpy(key.data(),&image.quickHash,8);
+                                std::memcpy(key.data()+8,&image.sampleHash,8);
+                                samples[key].push_back(index);
+                            }
                         }
-                        pool.waitForDone();
-                        std::vector<int> checkpoint; checkpoint.reserve(end-base);
-                        for (size_t pos=base;pos<end;++pos) if (completed[pos-base]) checkpoint.push_back(pending[pos]);
-                        saveCheckpoint(checkpoint);
-                        if (cancelled_) { out.cancelled=true; return out; }
+                        for (auto sample=samples.cbegin();sample!=samples.cend();++sample) {
+                            if (sample.value().size()<2) continue;
+                            for (int index:sample.value())
+                                if (out.images[size_t(index)].blake3.size()!=kBlake3DigestBytes)
+                                    pendingFull.push_back(index);
+                        }
                     }
-                    QHash<QString,std::vector<int>> exact;
+
+                    std::atomic<int> fullyHashed{0};
+                    post(QStringLiteral("Hashing remaining candidates with BLAKE3..."),0,int(pendingFull.size()));
+                    runPersistentPipeline(pendingFull.size(),readers,cancelled_,
+                        [&](size_t position) {
+                            const int index=pendingFull[position];
+                            const ExactHashResult result=hashFileBlake3(out.images[size_t(index)].file);
+                            if (result.ok) out.images[size_t(index)].blake3=result.blake3;
+                            const int count=++fullyHashed;
+                            if ((count&15)==0 || count==int(pendingFull.size()))
+                                post(QStringLiteral("BLAKE3 full hash • %1 / %2")
+                                     .arg(count).arg(pendingFull.size()),count,int(pendingFull.size()));
+                            return result.ok ? index : -1;
+                        },saveCheckpoint);
+                    if (cancelled_) { out.cancelled=true; return out; }
+
+                    QHash<QByteArray,std::vector<int>> exact;
                     for (int i=0;i<n;++i) {
-                        const auto& bucket=bySize[out.images[size_t(i)].size];
-                        if (bucket.size()==1) { if (showSingles) out.groups.push_back({i}); }
-                        else if (!out.images[size_t(i)].md5.isEmpty() && out.images[size_t(i)].md5!="error") exact[out.images[size_t(i)].md5].push_back(i);
-                        else if (showSingles) out.groups.push_back({i});
+                        const ImgMeta& image=out.images[size_t(i)];
+                        if (image.blake3.size()!=kBlake3DigestBytes) continue;
+                        QByteArray key(8,Qt::Uninitialized);
+                        for (int byte=0;byte<8;++byte)
+                            key[byte]=char((quint64(image.size)>>(byte*8))&0xffu);
+                        key+=image.blake3;
+                        exact[key].push_back(i);
                     }
-                    for (auto it=exact.begin();it!=exact.end();++it) if (showSingles || it.value().size()>1) out.groups.push_back(std::move(it.value()));
+                    std::vector<bool> grouped(size_t(n),false);
+                    for (auto it=exact.begin();it!=exact.end();++it) {
+                        if (it.value().size()<2) continue;
+                        for (int index:it.value()) grouped[size_t(index)]=true;
+                        out.groups.push_back(std::move(it.value()));
+                    }
+                    if (showSingles)
+                        for (int i=0;i<n;++i) if (!grouped[size_t(i)]) out.groups.push_back({i});
                     std::sort(out.groups.begin(),out.groups.end(),[](const auto& a,const auto& b){return a.front()<b.front();});
                 } else {
                     std::vector<int> pending;
-                    for (int i=0;i<n;++i) if (!hasHash(out.images[size_t(i)],algo)) pending.push_back(i);
+                    for (int i=0;i<n;++i) {
+                        const bool missing=calculateAll
+                            ? (out.images[size_t(i)].hashMask & kAllPerceptualHashes)!=kAllPerceptualHashes
+                            : !hasHash(out.images[size_t(i)],algo);
+                        if (missing) pending.push_back(i);
+                    }
                     if (!pending.empty()) {
                         existing.reset();
+                        existingBands.reset();
                         post(QStringLiteral("Calculating %1 once, then caching it...").arg(QString::fromLatin1(algoName(algo))),0,int(pending.size()));
-                        QThreadPool pool; pool.setMaxThreadCount(workerCount()); std::atomic<int> done{0};
-                        for (size_t base=0;base<pending.size();base+=checkpointSize) {
-                            const size_t end=std::min(base+checkpointSize,pending.size());
-                            std::vector<char> completed(end-base,0);
-                            for (size_t pos=base;pos<end;++pos) {
-                                const int idx=pending[pos];
-                                pool.start(new FunctionTask([&,idx,pos,base]{
-                                    if (!cancelled_) {
-                                        out.images[size_t(idx)].valid=readAndHash(out.images[size_t(idx)],algo);
-                                        completed[pos-base]=1;
-                                    }
-                                    const int d=++done; if ((d&63)==0 || d==int(pending.size())) post(QStringLiteral("Lazy hashing • %1 / %2").arg(d).arg(pending.size()),d,int(pending.size()));
-                                }));
-                            }
-                            pool.waitForDone();
-                            std::vector<int> checkpoint; checkpoint.reserve(end-base);
-                            for (size_t pos=base;pos<end;++pos)
-                                if (completed[pos-base] && out.images[size_t(pending[pos])].valid) checkpoint.push_back(pending[pos]);
-                            saveCheckpoint(checkpoint);
-                            if (cancelled_) { out.cancelled=true; return out; }
-                        }
+                        std::atomic<int> done{0};
+                        runPersistentPipeline(pending.size(),decoderWorkerCount(root),cancelled_,
+                            [&](size_t position) {
+                                const int index=pending[position];
+                                if (cancelled_) return -1;
+                                try {
+                                    out.images[size_t(index)].valid=
+                                        readAndHash(out.images[size_t(index)],algo,calculateAll);
+                                } catch (...) { out.images[size_t(index)].valid=false; }
+                                const int count=++done;
+                                if ((count&63)==0 || count==int(pending.size()))
+                                    post(QStringLiteral("Hashing • %1 / %2")
+                                         .arg(count).arg(pending.size()),count,int(pending.size()));
+                                return out.images[size_t(index)].valid ? index : -1;
+                            },saveCheckpoint);
+                        if (cancelled_) { out.cancelled=true; return out; }
                         out.images.erase(std::remove_if(out.images.begin(),out.images.end(),[](const ImgMeta& m){return !m.valid;}),out.images.end());
                         n=int(out.images.size());
                     }
-                    if (!existing) {
-                        post(QStringLiteral("Building similarity index..."),0,n);
-                        existing=std::make_shared<BKTree<BitHash>>(hamming);
+                    if (useBandIndex && !existingBands) {
+                        post(QStringLiteral("Building large-library band index..."),0,n);
+                        existingBands=std::make_shared<HashBandIndex<BitHash>>();
+                        std::vector<BitHash> hashes;
+                        hashes.reserve(size_t(n));
+                        for (const ImgMeta& image:out.images)
+                            hashes.push_back(pickHash(image,algo));
+                        if (cancelled_) { out.cancelled=true; return out; }
+                        existingBands->build(hashes,workerCount());
+                    } else if (!useBandIndex && !existing) {
+                        post(QStringLiteral("Building compact BK-tree..."),0,n);
+                        existing=std::make_shared<BKTree<BitHash>>();
+                        existing->reserve(size_t(n));
                         for (int i=0;i<n;++i) {
                             existing->add(pickHash(out.images[size_t(i)],algo),i);
-                            if ((i&2047)==0) post(QStringLiteral("Building similarity index... %1 / %2").arg(i).arg(n),i,n);
+                            if ((i&2047)==0) post(QStringLiteral("Building compact BK-tree... %1 / %2").arg(i).arg(n),i,n);
                             if (cancelled_) { out.cancelled=true; return out; }
                         }
                     }
                     out.tree=existing;
+                    out.bandIndex=existingBands;
                     post(QStringLiteral("Forming representative-based groups..."),0,n);
                     std::vector<bool> assigned(size_t(n),false);
-                    for (int i=0;i<n;++i) {
-                        if (assigned[size_t(i)]) continue;
-                        std::vector<int> group{i}; assigned[size_t(i)]=true;
-                        auto hits=existing->query(pickHash(out.images[size_t(i)],algo),threshold,i);
-                        std::sort(hits.begin(),hits.end());
-                        for (int hit:hits) if (!assigned[size_t(hit)] && hamming(pickHash(out.images[size_t(i)],algo),pickHash(out.images[size_t(hit)],algo))<=threshold) {
-                            assigned[size_t(hit)]=true; group.push_back(hit);
-                        }
-                        if (showSingles || group.size()>1) out.groups.push_back(std::move(group));
-                        if ((i&2047)==0) post(QStringLiteral("Grouping... %1 / %2").arg(i).arg(n),i,n);
+                    constexpr int queryChunk=4096;
+                    for (int base=0;base<n;base+=queryChunk) {
+                        const int count=std::min(queryChunk,n-base);
+                        std::vector<std::vector<int>> hits(static_cast<size_t>(count));
+                        runPersistentPipeline(size_t(count),workerCount(),cancelled_,
+                            [&](size_t position) {
+                                const int index=base+int(position);
+                                hits[position]=useBandIndex
+                                    ? existingBands->query(pickHash(out.images[size_t(index)],algo),threshold,index)
+                                    : existing->query(pickHash(out.images[size_t(index)],algo),threshold,index);
+                                std::sort(hits[position].begin(),hits[position].end());
+                                return -1;
+                            },[](const std::vector<int>&){});
                         if (cancelled_) { out.cancelled=true; return out; }
+                        for (int offset=0;offset<count;++offset) {
+                            const int i=base+offset;
+                            if (assigned[size_t(i)]) continue;
+                            std::vector<int> group{i}; assigned[size_t(i)]=true;
+                            for (int hit:hits[size_t(offset)])
+                                if (!assigned[size_t(hit)]
+                                    && hamming(pickHash(out.images[size_t(i)],algo),
+                                               pickHash(out.images[size_t(hit)],algo))<=threshold) {
+                                    assigned[size_t(hit)]=true; group.push_back(hit);
+                                }
+                            if (showSingles || group.size()>1) out.groups.push_back(std::move(group));
+                        }
+                        post(QStringLiteral("Grouping... %1 / %2").arg(std::min(base+count,n)).arg(n),
+                             std::min(base+count,n),n);
                     }
                 }
                 for (auto& m:out.images) m.group=-1;
@@ -1583,8 +2636,8 @@ private:
     void deleteAllMd5Duplicates() {
         if (busy_.load()) return;
         if (currentAlgorithm() != HashAlgo::MD5) {
-            QMessageBox::information(this, QStringLiteral("MD5 Required"),
-                                     QStringLiteral("This action is available only in Exact MD5 mode."));
+            QMessageBox::information(this, QStringLiteral("Exact Files Required"),
+                                     QStringLiteral("This action is available only in Exact Files mode."));
             return;
         }
 
@@ -1598,12 +2651,12 @@ private:
         }
         if (!eligibleGroups) {
             QMessageBox::information(this, QStringLiteral("No Exact Duplicates"),
-                                     QStringLiteral("There are no MD5 groups containing more than one existing file."));
+                                     QStringLiteral("There are no exact groups containing more than one existing file."));
             return;
         }
 
         QDialog dialog(this);
-        dialog.setWindowTitle(QStringLiteral("Keep One File Per MD5 Group"));
+        dialog.setWindowTitle(QStringLiteral("Keep One File Per Exact Group"));
         dialog.setMinimumWidth(540);
         auto* layout=new QVBoxLayout(&dialog);
         layout->setContentsMargins(20,18,20,18);
@@ -1654,7 +2707,7 @@ private:
 
         const auto rule=static_cast<Md5KeepRule>(rules->currentData().toInt());
         const QString ruleLabel=rules->currentText();
-        QStringList toDelete;
+        std::vector<ExactDeleteCandidate> toDelete;
         for (const auto& group:groups_) {
             std::vector<int> valid;
             valid.reserve(group.size());
@@ -1662,15 +2715,17 @@ private:
                 if (idx>=0 && idx<int(images_.size()) && !images_[size_t(idx)].file.isEmpty()) valid.push_back(idx);
             if (valid.size()<2) continue;
             const int keeper=chooseMd5Keeper(valid,rule);
-            for (int idx:valid) if (idx!=keeper) toDelete << images_[size_t(idx)].file;
+            for (int idx:valid) if (idx!=keeper)
+                toDelete.push_back({images_[size_t(keeper)].file,images_[size_t(idx)].file});
         }
-        if (toDelete.isEmpty()) return;
+        if (toDelete.empty()) return;
 
         QMessageBox confirm(QMessageBox::Warning, QStringLiteral("Confirm Bulk Delete"),
             QStringLiteral("Move %1 files from %2 exact-match groups to the Recycle Bin?")
                 .arg(toDelete.size()).arg(eligibleGroups),
             QMessageBox::Yes|QMessageBox::Cancel, this);
-        confirm.setInformativeText(QStringLiteral("%1. Exactly one file will remain in every group.").arg(ruleLabel));
+        confirm.setInformativeText(QStringLiteral(
+            "%1. Every candidate will be compared byte-for-byte with its keeper before deletion.").arg(ruleLabel));
         confirm.setDefaultButton(QMessageBox::Cancel);
         if (confirm.exec()!=QMessageBox::Yes) return;
         startBulkDelete(std::move(toDelete),eligibleGroups,ruleLabel);
@@ -1737,7 +2792,9 @@ private:
         }
     }
 
-    void startBulkDelete(QStringList toDelete, int groupCount, const QString& ruleLabel) {
+    void startBulkDelete(std::vector<ExactDeleteCandidate> toDelete, int groupCount,
+                         const QString& ruleLabel) {
+        const int total=int(toDelete.size());
         clearThumbs();
         QCoreApplication::processEvents();
         busy_=true;
@@ -1745,12 +2802,12 @@ private:
         cancelled_=false;
         setInteractive(false);
         prog_->setVisible(true);
-        prog_->setRange(0,toDelete.size());
+        prog_->setRange(0,total);
         prog_->setValue(0);
-        statusTxt_->setText(QStringLiteral("Deleting exact duplicates… 0 / %1").arg(toDelete.size()));
+        statusTxt_->setText(QStringLiteral("Deleting exact duplicates… 0 / %1").arg(total));
 
         QPointer<DupeGemMainWindow> self(this);
-        auto post=[self,total=toDelete.size()](int done) {
+        auto post=[self,total](int done) {
             if (!self) return;
             QMetaObject::invokeMethod(self,[self,done,total]{
                 if (!self || !self->bulkDeleting_.load()) return;
@@ -1769,13 +2826,14 @@ private:
             prog_->setVisible(false);
             busy_=false;
 
-            if (!result.failed.isEmpty()) {
-                QStringList shown=result.failed.mid(0,12);
-                if (result.failed.size()>shown.size())
-                    shown << QStringLiteral("…and %1 more").arg(result.failed.size()-shown.size());
+            const QStringList problems=result.failed+result.verificationFailed;
+            if (!problems.isEmpty()) {
+                QStringList shown=problems.mid(0,12);
+                if (problems.size()>shown.size())
+                    shown << QStringLiteral("…and %1 more").arg(problems.size()-shown.size());
                 QMessageBox::warning(this,QStringLiteral("Some Files Could Not Be Deleted"),
-                    QStringLiteral("%1 file(s) could not be moved to the Recycle Bin:\n\n%2")
-                        .arg(result.failed.size()).arg(shown.join('\n')));
+                    QStringLiteral("%1 file(s) failed byte verification or could not be recycled:\n\n%2")
+                        .arg(problems.size()).arg(shown.join('\n')));
             }
 
             if (!result.deleted.isEmpty()) {
@@ -1791,15 +2849,17 @@ private:
             }
         });
 
-        watcher->setFuture(QtConcurrent::run([toDelete=std::move(toDelete),self,post]() mutable {
+        watcher->setFuture(QtConcurrent::run([toDelete=std::move(toDelete),self,post,total]() mutable {
             BulkDeleteResult result;
-            for (int i=0;i<toDelete.size();++i) {
+            for (int i=0;i<total;++i) {
                 if (!self || self->cancelled_.load()) { result.cancelled=true; break; }
-                const QString& path=toDelete[i];
-                if (QFile::moveToTrash(path)) result.deleted << path;
-                else result.failed << path;
+                const ExactDeleteCandidate& candidate=toDelete[size_t(i)];
+                if (!filesByteEqual(candidate.keeper,candidate.target))
+                    result.verificationFailed << candidate.target;
+                else if (QFile::moveToTrash(candidate.target)) result.deleted << candidate.target;
+                else result.failed << candidate.target;
                 const int done=i+1;
-                if ((done&15)==0 || done==toDelete.size()) post(done);
+                if ((done&15)==0 || done==total) post(done);
             }
             return result;
         }));
@@ -1835,6 +2895,7 @@ private:
         const bool md5=currentAlgorithm()==HashAlgo::MD5;
         thresholdRow_->setVisible(!md5);
         md5TypesRow_->setVisible(md5);
+        cacheAllHashes_->setVisible(!md5);
         btnDeleteAllGroups_->setVisible(md5);
         btnRegroup_->setText(md5 ? QStringLiteral("Rescan/Regroup Files")
                                 : QStringLiteral("Rescan/Regroup Images"));
@@ -1878,26 +2939,6 @@ private:
         QScrollBar* bar=scroll_->verticalScrollBar();
         const int preload=scroll_->viewport()->height()*2;
         if (bar->maximum()==0 || bar->value()+preload>=bar->maximum()) addTimer_->start(0);
-    }
-
-    // ---- MD5 helpers (only used by MD5 mode) ----
-    static QString md5ForFile(const QString& path) {
-        QFile f(path);
-        if (!f.open(QIODevice::ReadOnly)) return QStringLiteral("error");
-        QCryptographicHash hh(QCryptographicHash::Md5);
-        QByteArray buffer(1<<20, Qt::Uninitialized);
-        while (true) {
-            const qint64 bytes=f.read(buffer.data(), buffer.size());
-            if (bytes<0) return QStringLiteral("error");
-            if (bytes==0) break;
-            hh.addData(QByteArrayView(buffer.constData(), bytes));
-        }
-        return hh.result().toHex();
-    }
-    inline void ensureMd5(ImgMeta& m) {
-        if (m.md5.isEmpty() || m.md5 == QStringLiteral("error")) {
-            m.md5 = md5ForFile(m.file);
-        }
     }
 
     // === Utility ===
@@ -2174,6 +3215,7 @@ private:
     QFutureWatcher<GroupResult>* groupWatcher_{};
     QFutureWatcher<BulkDeleteResult>* bulkDeleteWatcher_{};
     std::map<HashAlgo, std::shared_ptr<BKTree<BitHash>>> trees_;
+    std::map<HashAlgo, std::shared_ptr<HashBandIndex<BitHash>>> bandIndices_;
 
     // Layout containers
     QSplitter* leftSplit_{};
@@ -2203,6 +3245,7 @@ private:
     QLabel*      thumbLabel_{};
     QPushButton* btnRegroup_{};
     QCheckBox*   showSingles_{};
+    QCheckBox*   cacheAllHashes_{};
     QLabel*      statusTxt_{};
     QProgressBar* prog_{};
     QPushButton*  btnCancel_{};
@@ -2237,10 +3280,20 @@ private:
 
 int main(int argc, char *argv[]) {
     qInstallMessageHandler(dg::qtMessageHandler);
+    QCoreApplication::setApplicationName(QStringLiteral("DupeGem"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("0.4.0"));
+    QCoreApplication::setOrganizationName(QStringLiteral("DupeGem"));
     bool imageLimitOk=false;
     int imageLimitMb=qEnvironmentVariableIntValue("DUPEGEM_IMAGE_LIMIT_MB", &imageLimitOk);
     if (!imageLimitOk || imageLimitMb<32) imageLimitMb=128;
     QImageReader::setAllocationLimit(std::clamp(imageLimitMb, 32, 4096));
+    bool benchmark=false;
+    for (int i=1;i<argc;++i) if (QString::fromLocal8Bit(argv[i])==QStringLiteral("--benchmark")) benchmark=true;
+    if (benchmark) {
+        QCoreApplication app(argc, argv);
+        return dg::runBenchmark(app.arguments());
+    }
+
     QApplication app(argc, argv);
     dg::DupeGemMainWindow w;
     w.show();

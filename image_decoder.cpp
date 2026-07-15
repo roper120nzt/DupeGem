@@ -19,6 +19,7 @@
 
 #include <libheif/heif.h>
 #include <libraw/libraw.h>
+#include <turbojpeg.h>
 
 #ifdef Q_OS_WIN
 #ifndef NOMINMAX
@@ -118,6 +119,169 @@ QImage finishScale(QImage image, const QSize& target, Qt::AspectRatioMode mode) 
     const QSize wanted = requestedSize(image.size(), target, mode);
     if (!wanted.isValid() || wanted == image.size()) return image;
     return image.scaled(wanted, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+}
+
+class TurboJpegHandle {
+public:
+    TurboJpegHandle() : value(tj3Init(TJINIT_DECOMPRESS)) {}
+    ~TurboJpegHandle() { if (value) tj3Destroy(value); }
+    tjhandle value{};
+};
+
+struct ByteSpan {
+    const uchar* data{};
+    size_t size{};
+};
+
+quint16 exif16(const uchar* data, bool littleEndian) {
+    return littleEndian ? quint16(data[0]) | (quint16(data[1]) << 8)
+                        : (quint16(data[0]) << 8) | quint16(data[1]);
+}
+
+quint32 exif32(const uchar* data, bool littleEndian) {
+    return littleEndian
+        ? quint32(data[0]) | (quint32(data[1]) << 8) | (quint32(data[2]) << 16)
+            | (quint32(data[3]) << 24)
+        : (quint32(data[0]) << 24) | (quint32(data[1]) << 16)
+            | (quint32(data[2]) << 8) | quint32(data[3]);
+}
+
+ByteSpan exifThumbnail(const uchar* jpeg, size_t size) {
+    if (!jpeg || size<4 || jpeg[0]!=0xff || jpeg[1]!=0xd8) return {};
+    size_t position=2;
+    while (position+4<=size) {
+        while (position<size && jpeg[position]!=0xff) ++position;
+        while (position<size && jpeg[position]==0xff) ++position;
+        if (position>=size) break;
+        const uchar marker=jpeg[position++];
+        if (marker==0xda || marker==0xd9) break;
+        if (marker==0x01 || (marker>=0xd0 && marker<=0xd8)) continue;
+        if (position+2>size) break;
+        const size_t segmentLength=(size_t(jpeg[position])<<8)|jpeg[position+1];
+        if (segmentLength<2 || position+segmentLength>size) break;
+        const uchar* payload=jpeg+position+2;
+        const size_t payloadSize=segmentLength-2;
+        position+=segmentLength;
+        if (marker!=0xe1 || payloadSize<14
+            || std::memcmp(payload,"Exif\0\0",6)!=0) continue;
+
+        const uchar* tiff=payload+6;
+        const size_t tiffSize=payloadSize-6;
+        const bool little=tiff[0]=='I' && tiff[1]=='I';
+        const bool big=tiff[0]=='M' && tiff[1]=='M';
+        if ((!little && !big) || exif16(tiff+2,little)!=42 || tiffSize<8) continue;
+        const quint32 ifd0=exif32(tiff+4,little);
+        if (ifd0>tiffSize-2) continue;
+        const quint16 entries=exif16(tiff+ifd0,little);
+        const size_t nextOffset=size_t(ifd0)+2+size_t(entries)*12;
+        if (nextOffset+4>tiffSize) continue;
+        const quint32 ifd1=exif32(tiff+nextOffset,little);
+        if (ifd1==0 || ifd1>tiffSize-2) continue;
+        const quint16 thumbEntries=exif16(tiff+ifd1,little);
+        if (size_t(ifd1)+2+size_t(thumbEntries)*12>tiffSize) continue;
+        quint32 offset=0,length=0;
+        for (quint16 i=0;i<thumbEntries;++i) {
+            const uchar* entry=tiff+ifd1+2+size_t(i)*12;
+            const quint16 tag=exif16(entry,little);
+            if (tag==0x0201) offset=exif32(entry+8,little);
+            else if (tag==0x0202) length=exif32(entry+8,little);
+        }
+        if (offset && length>=4 && offset<=tiffSize && length<=tiffSize-offset
+            && tiff[offset]==0xff && tiff[offset+1]==0xd8)
+            return {tiff+offset,size_t(length)};
+    }
+    return {};
+}
+
+QImage applyIoTransformation(QImage image, QImageIOHandler::Transformations transformation) {
+    if (image.isNull() || transformation==QImageIOHandler::TransformationNone) return image;
+    if (transformation & QImageIOHandler::TransformationMirror)
+        image=image.flipped(Qt::Horizontal);
+    if (transformation & QImageIOHandler::TransformationFlip)
+        image=image.flipped(Qt::Vertical);
+    if (transformation & QImageIOHandler::TransformationRotate90)
+        image=image.transformed(QTransform().rotate(90));
+    return image;
+}
+
+QImage decodeJpegForHash(const QString& path, const QSize& target, QSize* sourceSize) {
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly) || file.size()<=0) return {};
+    const qint64 fileSize=file.size();
+    uchar* mapped=file.map(0,fileSize);
+    QByteArray fallback;
+    const uchar* bytes=mapped;
+    if (!bytes) {
+        fallback=file.readAll();
+        if (fallback.size()!=fileSize) return {};
+        bytes=reinterpret_cast<const uchar*>(fallback.constData());
+    }
+
+    TurboJpegHandle jpeg;
+    if (!jpeg.value || tj3DecompressHeader(jpeg.value,bytes,size_t(fileSize))<0) {
+        if (mapped) file.unmap(mapped);
+        return {};
+    }
+    const int width=tj3Get(jpeg.value,TJPARAM_JPEGWIDTH);
+    const int height=tj3Get(jpeg.value,TJPARAM_JPEGHEIGHT);
+    const int precision=tj3Get(jpeg.value,TJPARAM_PRECISION);
+    if (width<=0 || height<=0 || precision>8) {
+        if (mapped) file.unmap(mapped);
+        return {};
+    }
+
+    QImageReader metadata(path);
+    metadata.setAutoTransform(true);
+    const auto transformation=metadata.transformation();
+    const bool transposed=transformation & QImageIOHandler::TransformationRotate90;
+    QSize source(width,height);
+    if (transposed) source.transpose();
+    if (sourceSize) *sourceSize=source;
+
+    QSize decoderTarget=target;
+    if (transposed) decoderTarget.transpose();
+    auto decodeGray=[&](TurboJpegHandle& handle,const uchar* input,size_t inputSize,
+                        int inputWidth,int inputHeight) {
+        int factorCount=0;
+        tjscalingfactor* factors=tj3GetScalingFactors(&factorCount);
+        tjscalingfactor selected=TJUNSCALED;
+        qint64 bestArea=std::numeric_limits<qint64>::max();
+        for (int i=0;i<factorCount;++i) {
+            const int scaledWidth=TJSCALED(inputWidth,factors[i]);
+            const int scaledHeight=TJSCALED(inputHeight,factors[i]);
+            const bool sufficient=(decoderTarget.width()<=0 || scaledWidth>=decoderTarget.width())
+                && (decoderTarget.height()<=0 || scaledHeight>=decoderTarget.height());
+            const qint64 area=qint64(scaledWidth)*scaledHeight;
+            if (sufficient && area<bestArea) { selected=factors[i]; bestArea=area; }
+        }
+        if (tj3SetScalingFactor(handle.value,selected)<0) return QImage{};
+        const int scaledWidth=TJSCALED(inputWidth,selected);
+        const int scaledHeight=TJSCALED(inputHeight,selected);
+        QImage image(scaledWidth,scaledHeight,QImage::Format_Grayscale8);
+        if (image.isNull() || tj3Decompress8(handle.value,input,inputSize,image.bits(),
+                                             image.bytesPerLine(),TJPF_GRAY)<0) return QImage{};
+        return image;
+    };
+
+    QImage image;
+    const ByteSpan thumbnail=exifThumbnail(bytes,size_t(fileSize));
+    if (thumbnail.data) {
+        TurboJpegHandle preview;
+        if (preview.value && tj3DecompressHeader(preview.value,thumbnail.data,thumbnail.size)>=0) {
+            const int thumbWidth=tj3Get(preview.value,TJPARAM_JPEGWIDTH);
+            const int thumbHeight=tj3Get(preview.value,TJPARAM_JPEGHEIGHT);
+            const int thumbPrecision=tj3Get(preview.value,TJPARAM_PRECISION);
+            const bool sufficient=(decoderTarget.width()<=0 || thumbWidth>=decoderTarget.width())
+                && (decoderTarget.height()<=0 || thumbHeight>=decoderTarget.height());
+            if (thumbPrecision<=8 && sufficient)
+                image=decodeGray(preview,thumbnail.data,thumbnail.size,thumbWidth,thumbHeight);
+        }
+    }
+    if (image.isNull()) image=decodeGray(jpeg,bytes,size_t(fileSize),width,height);
+    if (mapped) file.unmap(mapped);
+    if (image.isNull()) return {};
+    image=applyIoTransformation(std::move(image),transformation);
+    return finishScale(std::move(image),target,Qt::IgnoreAspectRatio);
 }
 
 #ifdef Q_OS_WIN
@@ -320,6 +484,17 @@ HeifHandle bestHeifHandle(heif_image_handle* primary, const QSize& target) {
 
 QImage decodeHeif(const QString& path, const QSize& target, Qt::AspectRatioMode mode,
                   QSize* sourceSize, bool pixels) {
+    static QSemaphore decodeSlots([] {
+        bool ok=false;
+        const int requested=qEnvironmentVariableIntValue("DUPEGEM_HEIF_THREADS",&ok);
+        return ok && requested>0 ? std::clamp(requested,1,16) : 4;
+    }());
+    struct Slot {
+        explicit Slot(QSemaphore& value) : value(value) { value.acquire(); }
+        ~Slot() { value.release(); }
+        QSemaphore& value;
+    } slot(decodeSlots);
+
     HeifFileReader reader;
     HeifContext context;
     HeifHandle primary;
@@ -379,15 +554,18 @@ public:
     libraw_processed_image_t* value{};
 };
 
-QSemaphore& fullDecodeSlots() {
-    static QSemaphore semaphore(2);
-    return semaphore;
+int decoderLimit(const char* variable, int fallback, int maximum) {
+    bool ok=false;
+    const int requested=qEnvironmentVariableIntValue(variable,&ok);
+    return ok && requested>0 ? std::clamp(requested,1,maximum) : fallback;
 }
 
 class DecodeSlot {
 public:
-    DecodeSlot() { fullDecodeSlots().acquire(); }
-    ~DecodeSlot() { fullDecodeSlots().release(); }
+    explicit DecodeSlot(QSemaphore& semaphore) : semaphore_(semaphore) { semaphore_.acquire(); }
+    ~DecodeSlot() { semaphore_.release(); }
+private:
+    QSemaphore& semaphore_;
 };
 
 bool openRaw(const QString& path, LibRaw& raw) {
@@ -402,6 +580,8 @@ bool openRaw(const QString& path, LibRaw& raw) {
 
 QImage decodeRaw(const QString& path, const QSize& target, Qt::AspectRatioMode mode,
                  QSize* sourceSize, bool pixels) {
+    static QSemaphore previewSlots(decoderLimit("DUPEGEM_RAW_PREVIEW_THREADS",4,16));
+    DecodeSlot previewSlot(previewSlots);
     LibRaw raw;
     if (!openRaw(path, raw)) return {};
     const int flip = raw.imgdata.sizes.flip;
@@ -425,7 +605,8 @@ QImage decodeRaw(const QString& path, const QSize& target, Qt::AspectRatioMode m
 
     // Some RAW files have no usable embedded preview. Developing is expensive,
     // so cap concurrent fallbacks even when the normal hash pool is larger.
-    DecodeSlot slot;
+    static QSemaphore fullSlots(decoderLimit("DUPEGEM_RAW_FULL_THREADS",2,8));
+    DecodeSlot fullSlot(fullSlots);
     raw.recycle();
     if (!openRaw(path, raw)) return {};
     raw.imgdata.params.output_bps = 8;
@@ -459,6 +640,8 @@ QStringList supportedImageExtensions() {
 QStringList supportedVideoExtensions() { return videoExtensions(); }
 
 bool isSupportedVideoFile(const QString& path) { return isVideo(path); }
+bool isSupportedHeifFile(const QString& path) { return isHeif(path); }
+bool isSupportedRawFile(const QString& path) { return isRaw(path); }
 
 QImage decodeImage(const QString& path, const QSize& target, Qt::AspectRatioMode mode,
                    QSize* sourceSize) {
@@ -481,6 +664,16 @@ QImage decodeImage(const QString& path, const QSize& target, Qt::AspectRatioMode
     if (transposed) wanted.transpose();
     if (wanted.isValid()) reader.setScaledSize(wanted);
     return reader.read();
+}
+
+QImage decodeHashImage(const QString& path, const QSize& target, QSize* sourceSize) {
+    const QString suffix=suffixOf(path);
+    if (suffix==QStringLiteral("jpg") || suffix==QStringLiteral("jpeg")
+        || suffix==QStringLiteral("jfif")) {
+        QImage image=decodeJpegForHash(path,target,sourceSize);
+        if (!image.isNull()) return image;
+    }
+    return decodeImage(path,target,Qt::IgnoreAspectRatio,sourceSize);
 }
 
 QSize imageSourceSize(const QString& path) {

@@ -1,13 +1,22 @@
 param(
-    [string]$InputExe = "release\main.exe"
+    [string]$InputExe = "release\main.exe",
+    [string]$PortableRoot = "portable",
+    [string]$Version = "0.4.0"
 )
 
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
 $BuiltExe = Join-Path $ProjectRoot $InputExe
-$PortableRoot = Join-Path $ProjectRoot 'portable'
+$PortableRoot = if([IO.Path]::IsPathRooted($PortableRoot)){
+    [IO.Path]::GetFullPath($PortableRoot)
+} else {
+    [IO.Path]::GetFullPath((Join-Path $ProjectRoot $PortableRoot))
+}
 $OutDir = Join-Path $PortableRoot 'DupeGem'
-$ZipPath = Join-Path $PortableRoot 'DupeGem-portable.zip'
+if($Version -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$'){
+    throw "Invalid release version: $Version"
+}
+$ZipPath = Join-Path $PortableRoot "DupeGem-v$Version-portable.zip"
 
 if(-not (Test-Path -LiteralPath $BuiltExe -PathType Leaf)){
     throw "Build $InputExe first with qmake6 main.pro and mingw32-make."
