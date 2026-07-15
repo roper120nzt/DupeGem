@@ -20,6 +20,18 @@
 #include <libheif/heif.h>
 #include <libraw/libraw.h>
 
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <objbase.h>
+#include <shobjidl.h>
+#endif
+
 namespace dg {
 namespace {
 
@@ -50,12 +62,31 @@ const QStringList& rawExtensions() {
     return extensions;
 }
 
+const QStringList& videoExtensions() {
+    static const QStringList extensions{
+        QStringLiteral("3g2"), QStringLiteral("3gp"), QStringLiteral("amv"),
+        QStringLiteral("asf"), QStringLiteral("avi"), QStringLiteral("bik"),
+        QStringLiteral("braw"), QStringLiteral("dav"), QStringLiteral("divx"),
+        QStringLiteral("dv"), QStringLiteral("dvr-ms"), QStringLiteral("f4v"),
+        QStringLiteral("flv"), QStringLiteral("m1v"), QStringLiteral("m2ts"),
+        QStringLiteral("m2v"), QStringLiteral("m4v"), QStringLiteral("mkv"),
+        QStringLiteral("mov"), QStringLiteral("mp4"), QStringLiteral("mpe"),
+        QStringLiteral("mpeg"), QStringLiteral("mpg"), QStringLiteral("mpv"),
+        QStringLiteral("mts"), QStringLiteral("mxf"), QStringLiteral("ogm"),
+        QStringLiteral("ogv"), QStringLiteral("qt"), QStringLiteral("rm"),
+        QStringLiteral("rmvb"), QStringLiteral("ts"), QStringLiteral("vob"),
+        QStringLiteral("webm"), QStringLiteral("wmv"), QStringLiteral("wtv"),
+        QStringLiteral("y4m")};
+    return extensions;
+}
+
 QString suffixOf(const QString& path) {
     return QFileInfo(path).suffix().toLower();
 }
 
 bool isHeif(const QString& path) { return heifExtensions().contains(suffixOf(path)); }
 bool isRaw(const QString& path) { return rawExtensions().contains(suffixOf(path)); }
+bool isVideo(const QString& path) { return videoExtensions().contains(suffixOf(path)); }
 
 QSize orientedSize(QSize size, int flip) {
     if (flip == 5 || flip == 6) size.transpose();
@@ -88,6 +119,100 @@ QImage finishScale(QImage image, const QSize& target, Qt::AspectRatioMode mode) 
     if (!wanted.isValid() || wanted == image.size()) return image;
     return image.scaled(wanted, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
 }
+
+#ifdef Q_OS_WIN
+class ComScope {
+public:
+    ComScope() : result_(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
+    ~ComScope() {
+        if (result_ == S_OK || result_ == S_FALSE) CoUninitialize();
+    }
+    bool usable() const { return SUCCEEDED(result_) || result_ == RPC_E_CHANGED_MODE; }
+
+private:
+    HRESULT result_;
+};
+
+QSize videoThumbnailSize(const QSize& target) {
+    constexpr int fallbackWidth = 320;
+    constexpr int fallbackHeight = 180;
+    int width = target.width();
+    int height = target.height();
+    if (width <= 0 && height <= 0) {
+        width = fallbackWidth;
+        height = fallbackHeight;
+    } else if (width <= 0) {
+        width = qRound(height * 16.0 / 9.0);
+    } else if (height <= 0) {
+        height = qRound(width * 9.0 / 16.0);
+    }
+    return QSize(std::clamp(width, 1, 2048), std::clamp(height, 1, 2048));
+}
+
+QImage imageFromBitmap(HBITMAP bitmap) {
+    if (!bitmap) return {};
+    BITMAP details{};
+    if (!GetObjectW(bitmap, sizeof(details), &details)
+        || details.bmWidth <= 0 || details.bmHeight == 0) return {};
+
+    const int width = details.bmWidth;
+    const int height = std::abs(details.bmHeight);
+    QImage image(width, height, QImage::Format_ARGB32);
+    if (image.isNull()) return {};
+
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height; // Request top-down rows for QImage.
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+
+    HDC dc = GetDC(nullptr);
+    const int rows = dc ? GetDIBits(dc, bitmap, 0, UINT(height), image.bits(),
+                                    &info, DIB_RGB_COLORS) : 0;
+    if (dc) ReleaseDC(nullptr, dc);
+    if (rows != height) return {};
+
+    // Shell thumbnails are opaque, but some handlers leave the reserved alpha
+    // byte at zero. Make it explicit so Qt does not render a blank image.
+    for (int y = 0; y < height; ++y) {
+        QRgb* line = reinterpret_cast<QRgb*>(image.scanLine(y));
+        for (int x = 0; x < width; ++x) line[x] |= 0xff000000u;
+    }
+    return image;
+}
+
+QImage decodeVideoThumbnail(const QString& path, const QSize& target,
+                            Qt::AspectRatioMode mode) {
+    ComScope com;
+    if (!com.usable()) return {};
+
+    IShellItemImageFactory* factory = nullptr;
+    const std::wstring native = QDir::toNativeSeparators(path).toStdWString();
+    HRESULT result = SHCreateItemFromParsingName(native.c_str(), nullptr,
+                                                 IID_PPV_ARGS(&factory));
+    if (FAILED(result) || !factory) return {};
+
+    const QSize wanted = videoThumbnailSize(target);
+    SIZE shellSize{wanted.width(), wanted.height()};
+    HBITMAP bitmap = nullptr;
+    const SIIGBF flags = static_cast<SIIGBF>(SIIGBF_THUMBNAILONLY
+                                             | SIIGBF_BIGGERSIZEOK
+                                             | SIIGBF_RESIZETOFIT);
+    result = factory->GetImage(shellSize, flags, &bitmap);
+    factory->Release();
+    if (FAILED(result) || !bitmap) return {};
+
+    QImage image = imageFromBitmap(bitmap);
+    DeleteObject(bitmap);
+    return finishScale(std::move(image), target, mode);
+}
+#else
+QImage decodeVideoThumbnail(const QString&, const QSize&, Qt::AspectRatioMode) {
+    return {};
+}
+#endif
 
 class HeifContext {
 public:
@@ -331,9 +456,14 @@ QStringList supportedImageExtensions() {
     return extensions;
 }
 
+QStringList supportedVideoExtensions() { return videoExtensions(); }
+
+bool isSupportedVideoFile(const QString& path) { return isVideo(path); }
+
 QImage decodeImage(const QString& path, const QSize& target, Qt::AspectRatioMode mode,
                    QSize* sourceSize) {
     if (sourceSize) *sourceSize = {};
+    if (isVideo(path)) return decodeVideoThumbnail(path, target, mode);
     if (isHeif(path)) return decodeHeif(path, target, mode, sourceSize, true);
     if (isRaw(path)) return decodeRaw(path, target, mode, sourceSize, true);
 

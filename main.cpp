@@ -92,24 +92,6 @@ using BitHash = std::bitset<kHashBits>;
 enum class HashAlgo : int { DHash = 0, PHash, AHash, WHash, BHash, MD5, Count };
 enum class Md5KeepRule : int { Newest, Oldest, FilenameFirst, FilenameLast, ShortestName, LongestName };
 
-const QStringList& videoExtensions() {
-    static const QStringList extensions{
-        QStringLiteral("3g2"), QStringLiteral("3gp"), QStringLiteral("amv"),
-        QStringLiteral("asf"), QStringLiteral("avi"), QStringLiteral("bik"),
-        QStringLiteral("braw"), QStringLiteral("dav"), QStringLiteral("divx"),
-        QStringLiteral("dv"), QStringLiteral("dvr-ms"), QStringLiteral("f4v"),
-        QStringLiteral("flv"), QStringLiteral("m1v"), QStringLiteral("m2ts"),
-        QStringLiteral("m2v"), QStringLiteral("m4v"), QStringLiteral("mkv"),
-        QStringLiteral("mov"), QStringLiteral("mp4"), QStringLiteral("mpe"),
-        QStringLiteral("mpeg"), QStringLiteral("mpg"), QStringLiteral("mpv"),
-        QStringLiteral("mts"), QStringLiteral("mxf"), QStringLiteral("ogm"),
-        QStringLiteral("ogv"), QStringLiteral("qt"), QStringLiteral("rm"),
-        QStringLiteral("rmvb"), QStringLiteral("ts"), QStringLiteral("vob"),
-        QStringLiteral("webm"), QStringLiteral("wmv"), QStringLiteral("wtv"),
-        QStringLiteral("y4m")};
-    return extensions;
-}
-
 inline const char* algoName(HashAlgo a) {
     switch (a) {
         case HashAlgo::DHash: return "Difference Hash (dHash)";
@@ -649,7 +631,7 @@ public:
         img_ = new QLabel(this);
         img_->setAlignment(Qt::AlignCenter);
 
-        int w = thumbH_;
+        int w = isSupportedVideoFile(meta_.file) ? qRound(thumbH_ * 16.0 / 9.0) : thumbH_;
         if (meta_.resolution.isValid() && meta_.resolution.height() > 0) {
             const double aspect = double(meta_.resolution.width()) / double(meta_.resolution.height());
             w = qRound(aspect * thumbH_);
@@ -691,7 +673,10 @@ public:
     void updateInfo() {
         if (leader_.file.isEmpty()) { info_->clear(); return; }
 
-        const QString res = QStringLiteral("Res: %1x%2").arg(meta_.resolution.width()).arg(meta_.resolution.height());
+        const QString mediaInfo = meta_.resolution.isValid()
+            ? QStringLiteral("Res: %1x%2").arg(meta_.resolution.width()).arg(meta_.resolution.height())
+            : isSupportedVideoFile(meta_.file) ? QStringLiteral("Video thumbnail")
+                                                : QStringLiteral("Resolution unavailable");
         const QString size = QStringLiteral("Size: %1 MB").arg(QString::number(meta_.size / 1024.0 / 1024.0, 'f', 2));
 
         QString similarity=QStringLiteral("—");
@@ -702,7 +687,7 @@ public:
             similarity=QStringLiteral("%1% similar").arg(100-(hamming(pickHash(meta_,activeAlgo_),pickHash(leader_,activeAlgo_))*100/kHashBits));
 
         QStringList parts;
-        parts << QStringLiteral("%1 • %2").arg(res,size)
+        parts << QStringLiteral("%1 • %2").arg(mediaInfo,size)
               << QStringLiteral("%1: %2").arg(QString::fromLatin1(algoName(activeAlgo_)),similarity);
 
         if (!gifInfo_.isEmpty()) parts << gifInfo_;
@@ -764,7 +749,12 @@ private:
         auto* watcher=new QFutureWatcher<QImage>(this);
         connect(watcher,&QFutureWatcher<QImage>::finished,this,[this,watcher,bigGif]{
             const QImage image=watcher->result(); watcher->deleteLater();
-            if (image.isNull()) { img_->setText(QStringLiteral("Preview unavailable")); img_->setStyleSheet(QStringLiteral("color:#f87171;")); }
+            if (image.isNull()) {
+                img_->setText(isSupportedVideoFile(meta_.file)
+                                  ? QStringLiteral("Video thumbnail\nunavailable")
+                                  : QStringLiteral("Preview unavailable"));
+                img_->setStyleSheet(QStringLiteral("color:#f87171;"));
+            }
             else { img_->setText({}); img_->setPixmap(QPixmap::fromImage(image)); }
             if (bigGif) { gifInfo_=QStringLiteral("Large GIF • animation disabled"); updateInfo(); }
         });
@@ -1231,7 +1221,7 @@ private:
         const bool includeOther =algo==HashAlgo::MD5 && md5Other_->isChecked();
         QSet<QString> imageTypes, videoTypes;
         for (const QString& extension:supportedImageExtensions()) imageTypes.insert(extension.toLower());
-        for (const QString& extension:videoExtensions()) videoTypes.insert(extension.toLower());
+        for (const QString& extension:supportedVideoExtensions()) videoTypes.insert(extension.toLower());
         QStringList filters;
         auto addFilters=[&filters](const QSet<QString>& extensions){
             for (const QString& extension:extensions)
