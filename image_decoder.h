@@ -10,8 +10,13 @@ namespace dg {
 // Extensions supplied by Qt plus DupeGem's libheif and LibRaw decoders.
 QStringList supportedImageExtensions();
 
-// Reads an image and optionally scales it. A zero target dimension is derived
-// from the source aspect ratio; QSize() leaves the decoded size unchanged.
+// File types that can receive a lazy thumbnail from the Windows Shell.
+QStringList supportedVideoExtensions();
+bool isSupportedVideoFile(const QString& path);
+
+// Reads an image or requests a cached Windows video thumbnail, then optionally
+// scales it. A zero target dimension is derived from the source aspect ratio;
+// QSize() leaves decoded images unchanged and uses 320x180 for videos.
 QImage decodeImage(const QString& path, const QSize& target = QSize(),
                    Qt::AspectRatioMode mode = Qt::IgnoreAspectRatio,
                    QSize* sourceSize = nullptr);

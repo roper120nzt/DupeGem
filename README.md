@@ -63,6 +63,11 @@ Any combination can be enabled. Perceptual algorithms remain image-only.
 DupeGem's SQLite cache and its journal files are always excluded. MD5 content
 is still read only for files sharing the same byte size, regardless of category.
 
+Video cards display a static frame requested lazily from the Windows Explorer
+thumbnail provider. This reuses Windows' thumbnail cache and adds no playback
+runtime, so merely scanning large libraries does not decode every video. Preview
+availability depends on the codecs and thumbnail handlers installed in Windows.
+
 ## Build prerequisites
 
 Install Qt 6, libheif, and thread-safe LibRaw in the same MSYS2 MinGW64

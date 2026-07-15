@@ -22,6 +22,7 @@ CONFIG(debug, debug|release) {
 # packaging script deploys all runtime plugins; this copies the one SQL plugin
 # needed by release\main.exe during local build/test runs.
 win32 {
+    LIBS += -lole32 -lshell32 -lgdi32
     SQLITE_PLUGIN = $$[QT_INSTALL_PLUGINS]/sqldrivers/qsqlite.dll
     SQLITE_DEST = $$DESTDIR/sqldrivers
     QMAKE_POST_LINK += $$QMAKE_MKDIR $$shell_path($$SQLITE_DEST) $$escape_expand(\n\t)
