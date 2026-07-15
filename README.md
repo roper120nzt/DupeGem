@@ -112,6 +112,10 @@ you switch algorithms, its missing hashes are calculated once and persisted, so
 subsequent switches and rescans reuse them. Exact MD5 also avoids reading file
 contents until same-size candidates exist.
 
+Exact MD5 is the default algorithm. The selector is ordered roughly from fastest
+to slowest: MD5, aHash, dHash, wHash, bHash, then pHash. Existing cache algorithm
+identifiers remain unchanged, so upgrades continue to reuse saved hashes.
+
 Hash results are committed to SQLite every 1,000 images, including completed
 work from the active batch when you press Cancel. Starting the scan again resumes
 from the last checkpoint instead of recalculating those hashes.
