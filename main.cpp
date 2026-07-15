@@ -92,6 +92,24 @@ using BitHash = std::bitset<kHashBits>;
 enum class HashAlgo : int { DHash = 0, PHash, AHash, WHash, BHash, MD5, Count };
 enum class Md5KeepRule : int { Newest, Oldest, FilenameFirst, FilenameLast, ShortestName, LongestName };
 
+const QStringList& videoExtensions() {
+    static const QStringList extensions{
+        QStringLiteral("3g2"), QStringLiteral("3gp"), QStringLiteral("amv"),
+        QStringLiteral("asf"), QStringLiteral("avi"), QStringLiteral("bik"),
+        QStringLiteral("braw"), QStringLiteral("dav"), QStringLiteral("divx"),
+        QStringLiteral("dv"), QStringLiteral("dvr-ms"), QStringLiteral("f4v"),
+        QStringLiteral("flv"), QStringLiteral("m1v"), QStringLiteral("m2ts"),
+        QStringLiteral("m2v"), QStringLiteral("m4v"), QStringLiteral("mkv"),
+        QStringLiteral("mov"), QStringLiteral("mp4"), QStringLiteral("mpe"),
+        QStringLiteral("mpeg"), QStringLiteral("mpg"), QStringLiteral("mpv"),
+        QStringLiteral("mts"), QStringLiteral("mxf"), QStringLiteral("ogm"),
+        QStringLiteral("ogv"), QStringLiteral("qt"), QStringLiteral("rm"),
+        QStringLiteral("rmvb"), QStringLiteral("ts"), QStringLiteral("vob"),
+        QStringLiteral("webm"), QStringLiteral("wmv"), QStringLiteral("wtv"),
+        QStringLiteral("y4m")};
+    return extensions;
+}
+
 inline const char* algoName(HashAlgo a) {
     switch (a) {
         case HashAlgo::DHash: return "Difference Hash (dHash)";
@@ -409,8 +427,8 @@ inline int workerCount() {
 
 inline bool readAndHash(ImgMeta& m, HashAlgo algo) {
     if (algo==HashAlgo::MD5) {
-        if (!m.resolution.isValid()) m.resolution=imageSourceSize(m.file);
-        return m.resolution.isValid();
+        const QFileInfo info(m.file);
+        return info.isFile() && info.isReadable();
     }
     QSize source;
     QImage img=decodeImage(m.file,QSize(64,64),Qt::IgnoreAspectRatio,&source);
@@ -839,9 +857,11 @@ public:
         algoInfo_->setTextFormat(Qt::RichText);
         ctl->addWidget(algoInfo_);
 
-        // Row 3: Threshold slider (own row)
+        // Row 3: perceptual threshold, replaced by file categories in MD5 mode.
         {
-            auto* row = new QHBoxLayout;
+            thresholdRow_ = new QWidget;
+            auto* row = new QHBoxLayout(thresholdRow_);
+            row->setContentsMargins(0,0,0,0);
             row->addWidget(new QLabel(QStringLiteral("Threshold:")));
             thrSlider_ = new QSlider(Qt::Horizontal);
             thrSlider_->setRange(0,64);
@@ -851,7 +871,28 @@ public:
             row->addWidget(thrSlider_, 1);
             thrLabel_ = new QLabel(QStringLiteral("4 (min 98%)"));
             row->addWidget(thrLabel_);
-            ctl->addLayout(row);
+            ctl->addWidget(thresholdRow_);
+        }
+        {
+            md5TypesRow_ = new QWidget;
+            auto* row = new QHBoxLayout(md5TypesRow_);
+            row->setContentsMargins(0,0,0,0);
+            row->addWidget(new QLabel(QStringLiteral("Include:")));
+            md5Images_ = new QCheckBox(QStringLiteral("Images"));
+            md5Videos_ = new QCheckBox(QStringLiteral("Videos"));
+            md5Other_  = new QCheckBox(QStringLiteral("Other"));
+            md5Images_->setChecked(true);
+            const QString tip=QStringLiteral(
+                "Choose which file categories Exact MD5 scans. Any combination is allowed.");
+            for (QCheckBox* box:{md5Images_,md5Videos_,md5Other_}) box->setToolTip(tip);
+            md5Other_->setToolTip(QStringLiteral(
+                "Files that are neither recognized images nor common video formats. DupeGem cache files are excluded."));
+            row->addWidget(md5Images_);
+            row->addWidget(md5Videos_);
+            row->addWidget(md5Other_);
+            row->addStretch(1);
+            md5TypesRow_->setVisible(false);
+            ctl->addWidget(md5TypesRow_);
         }
 
         // Row 4: Thumbnail size slider (own row)
@@ -1079,7 +1120,7 @@ connect(scBksp, &QShortcut::activated, this, [this]{
 
         // Wire up actions
         connect(btnSelect_, &QPushButton::clicked, this, &DupeGemMainWindow::selectFolder);
-        connect(btnRegroup_,&QPushButton::clicked, this, &DupeGemMainWindow::regroup);
+        connect(btnRegroup_,&QPushButton::clicked, this, &DupeGemMainWindow::rescanOrRegroup);
         connect(btnDelete_, &QPushButton::clicked, this, &DupeGemMainWindow::deleteSelected);
         connect(btnDeleteAllGroups_, &QPushButton::clicked, this, &DupeGemMainWindow::deleteAllMd5Duplicates);
         connect(btnCancel_,&QPushButton::clicked,this,[this]{ cancelled_=true; statusTxt_->setText(QStringLiteral("Cancelling safely…")); btnCancel_->setEnabled(false); });
@@ -1088,18 +1129,32 @@ connect(scBksp, &QShortcut::activated, this, [this]{
         connect(sortCombo_,  qOverload<int>(&QComboBox::currentIndexChanged), this, &DupeGemMainWindow::resortGroups);
         filterTimer_=new QTimer(this); filterTimer_->setSingleShot(true); filterTimer_->setInterval(180);
         searchTimer_=new QTimer(this); searchTimer_->setSingleShot(true); searchTimer_->setInterval(180);
+        md5TypeTimer_=new QTimer(this); md5TypeTimer_->setSingleShot(true); md5TypeTimer_->setInterval(250);
         connect(filterTimer_,&QTimer::timeout,this,&DupeGemMainWindow::applyGroupFilter);
         connect(searchTimer_,&QTimer::timeout,this,[this]{ showGroup(currentGroup_); });
+        connect(md5TypeTimer_,&QTimer::timeout,this,[this]{
+            if (static_cast<HashAlgo>(algoCombo_->currentIndex())==HashAlgo::MD5
+                && !busy_.load() && !currentDir_.isEmpty()) startScan(currentDir_);
+        });
         connect(groupFilter_,&QLineEdit::textChanged,this,[this]{ filterTimer_->start(); });
         connect(algoCombo_,  qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int){
             updateAlgorithmInfo();
             // Disable threshold if MD5 is selected (exact matches only)
             const bool md5 = (static_cast<HashAlgo>(algoCombo_->currentIndex()) == HashAlgo::MD5);
-            thrSlider_->setEnabled(!md5);
-            thrLabel_->setEnabled(!md5);
+            thresholdRow_->setVisible(!md5);
+            md5TypesRow_->setVisible(md5);
             btnDeleteAllGroups_->setVisible(md5);
-            if(!images_.empty() && !busy_.load()) regroup();
+            btnRegroup_->setText(md5 ? QStringLiteral("Rescan/Regroup Files")
+                                    : QStringLiteral("Rescan/Regroup Images"));
+            if(!currentDir_.isEmpty() && !busy_.load()) startScan(currentDir_);
         });
+        auto categoryChanged=[this](bool){
+            if (static_cast<HashAlgo>(algoCombo_->currentIndex())==HashAlgo::MD5)
+                md5TypeTimer_->start();
+        };
+        connect(md5Images_,&QCheckBox::toggled,this,categoryChanged);
+        connect(md5Videos_,&QCheckBox::toggled,this,categoryChanged);
+        connect(md5Other_, &QCheckBox::toggled,this,categoryChanged);
         connect(showSingles_, &QCheckBox::toggled, this, &DupeGemMainWindow::regroup);
         connect(thrSlider_,   &QSlider::valueChanged, this, &DupeGemMainWindow::updateThrLabel);
         connect(sizeSlider_,  &QSlider::valueChanged, this, [this](int v){
@@ -1170,13 +1225,26 @@ private:
         prog_->setRange(0,0); prog_->setVisible(true);
         statusTxt_->setText(QStringLiteral("Enumerating files..."));
 
+        const auto algo=static_cast<HashAlgo>(algoCombo_->currentIndex());
+        const bool includeImages=algo!=HashAlgo::MD5 || md5Images_->isChecked();
+        const bool includeVideos=algo==HashAlgo::MD5 && md5Videos_->isChecked();
+        const bool includeOther =algo==HashAlgo::MD5 && md5Other_->isChecked();
+        QSet<QString> imageTypes, videoTypes;
+        for (const QString& extension:supportedImageExtensions()) imageTypes.insert(extension.toLower());
+        for (const QString& extension:videoExtensions()) videoTypes.insert(extension.toLower());
         QStringList filters;
-        for (const QString& extension: supportedImageExtensions()) {
-            filters << "*."+extension.toLower() << "*."+extension.toUpper();
+        auto addFilters=[&filters](const QSet<QString>& extensions){
+            for (const QString& extension:extensions)
+                filters << "*."+extension.toLower() << "*."+extension.toUpper();
+        };
+        if (includeOther) filters << QStringLiteral("*");
+        else {
+            if (includeImages) addFilters(imageTypes);
+            if (includeVideos) addFilters(videoTypes);
         }
+        if (filters.isEmpty()) filters << QStringLiteral("__dupegem_no_selected_file_types__");
         filters.removeDuplicates();
         const bool recurse=scanSubs_->isChecked();
-        const auto algo=static_cast<HashAlgo>(algoCombo_->currentIndex());
         const QString cachePath=cacheFile_;
         QPointer<DupeGemMainWindow> self(this);
         auto post=[self](const QString& text,int value=-1,int maximum=-1){
@@ -1191,7 +1259,7 @@ private:
 
         auto* watcher=new QFutureWatcher<ScanResult>(this);
         scanWatcher_=watcher;
-        connect(watcher,&QFutureWatcher<ScanResult>::finished,this,[this,watcher]{
+        connect(watcher,&QFutureWatcher<ScanResult>::finished,this,[this,watcher,algo]{
             ScanResult result=watcher->future().takeResult();
             watcher->deleteLater(); scanWatcher_=nullptr; scanning_=false;
             if (result.cancelled || cancelled_) {
@@ -1204,11 +1272,14 @@ private:
             }
             images_=std::move(result.images);
             if (!result.cacheWarning.isEmpty()) statusTxt_->setText(QStringLiteral("Cache unavailable: %1").arg(result.cacheWarning));
-            else statusTxt_->setText(QStringLiteral("%1 images • %2 cache hits").arg(images_.size()).arg(result.cacheHits));
+            else statusTxt_->setText(QStringLiteral("%1 %2 • %3 cache hits")
+                .arg(images_.size()).arg(algo==HashAlgo::MD5 ? QStringLiteral("files") : QStringLiteral("images"))
+                .arg(result.cacheHits));
             startGrouping();
         });
 
-        watcher->setFuture(QtConcurrent::run([dir,cachePath,filters,recurse,algo,post,this]{
+        watcher->setFuture(QtConcurrent::run([dir,cachePath,filters,recurse,algo,post,this,
+                                               imageTypes,videoTypes,includeImages,includeVideos,includeOther]{
             ScanResult out;
             try {
                 SqliteCache cache(cachePath);
@@ -1219,8 +1290,21 @@ private:
                 QDirIterator it(dir,filters,QDir::Files|QDir::Readable,flags);
                 while (it.hasNext()) {
                     if (cancelled_) { out.cancelled=true; return out; }
-                    files<<it.next();
-                    if ((files.size()&2047)==0) post(QStringLiteral("Discovering images... %1").arg(files.size()));
+                    const QString path=it.next();
+                    const QFileInfo candidate(path);
+                    const QString name=candidate.fileName();
+                    if (name.startsWith(QStringLiteral(".dupegem_cache."),Qt::CaseInsensitive)) continue;
+                    const QString suffix=candidate.suffix().toLower();
+                    const bool image=imageTypes.contains(suffix);
+                    const bool video=!image && videoTypes.contains(suffix);
+                    const bool accepted=algo!=HashAlgo::MD5 ? image
+                        : (image ? includeImages : (video ? includeVideos : includeOther));
+                    if (!accepted) continue;
+                    files<<path;
+                    if ((files.size()&2047)==0)
+                        post(QStringLiteral("Discovering %1... %2")
+                            .arg(algo==HashAlgo::MD5 ? QStringLiteral("files") : QStringLiteral("images"))
+                            .arg(files.size()));
                 }
                 std::sort(files.begin(),files.end(),[](const QString& a,const QString& b){
                     return QString::compare(a,b,Qt::CaseInsensitive)<0;
@@ -1240,10 +1324,10 @@ private:
                     if (found!=cached.end()) cached.erase(found);
                     m.file=files[i]; m.size=fi.size(); m.mtime=fi.lastModified().toMSecsSinceEpoch(); m.valid=true;
                     out.images[size_t(i)]=std::move(m);
-                    if ((algo==HashAlgo::MD5 && !out.images[size_t(i)].resolution.isValid()) ||
-                        (algo!=HashAlgo::MD5 && !hasHash(out.images[size_t(i)],algo))) pending.push_back(int(i));
+                    if (algo!=HashAlgo::MD5 && !hasHash(out.images[size_t(i)],algo)) pending.push_back(int(i));
                 }
-                post(QStringLiteral("Preparing %1 images...").arg(files.size()),0,int(pending.size()));
+                post(QStringLiteral("Preparing %1 %2...").arg(files.size())
+                    .arg(algo==HashAlgo::MD5 ? QStringLiteral("files") : QStringLiteral("images")),0,int(pending.size()));
                 QThreadPool pool; pool.setMaxThreadCount(workerCount());
                 std::atomic<int> done{0};
                 int checkpointed=0;
@@ -1275,7 +1359,12 @@ private:
                     if (cancelled_) { out.cancelled=true; return out; }
                 }
                 out.images.erase(std::remove_if(out.images.begin(),out.images.end(),[](const ImgMeta& m){return !m.valid;}),out.images.end());
-                if (cache.isOpen() && !cached.isEmpty() && !cache.removePaths(cached.keys())) out.cacheWarning=cache.error();
+                if (cache.isOpen() && !cached.isEmpty()) {
+                    QStringList missing;
+                    for (auto it=cached.cbegin();it!=cached.cend();++it)
+                        if (!QFileInfo::exists(root.absoluteFilePath(it.key()))) missing << it.key();
+                    if (!missing.isEmpty() && !cache.removePaths(missing)) out.cacheWarning=cache.error();
+                }
             } catch (const std::exception& e) { out.error=QString::fromLocal8Bit(e.what()); }
             catch (...) { out.error=QStringLiteral("Unknown background scan failure."); }
             return out;
@@ -1283,14 +1372,19 @@ private:
     }
 
     void startGrouping() {
+        const auto algo=static_cast<HashAlgo>(algoCombo_->currentIndex());
         if (images_.empty()) {
             busy_=false; prog_->setVisible(false); setInteractive(true);
-            headerLabel_->setText(QStringLiteral("No readable images found.")); return;
+            headerLabel_->setText(algo==HashAlgo::MD5
+                ? QStringLiteral("No files match the selected MD5 categories.")
+                : QStringLiteral("No readable images found."));
+            libraryStats_->setText(QStringLiteral("0 %1").arg(
+                algo==HashAlgo::MD5 ? QStringLiteral("files") : QStringLiteral("images")));
+            return;
         }
         clearThumbs(); groupsList_->clear(); groupIdxSorted_.clear();
         currentGroup_=-1; cancelled_=false; setInteractive(false);
         prog_->setVisible(true); prog_->setRange(0,0);
-        const auto algo=static_cast<HashAlgo>(algoCombo_->currentIndex());
         const int threshold=thrSlider_->value();
         const bool showSingles=showSingles_->isChecked();
         const QString root=currentDir_, cachePath=cacheFile_;
@@ -1323,9 +1417,14 @@ private:
             groups_=std::move(result.groups);
             if (result.tree) trees_[result.algo]=std::move(result.tree);
             prog_->setVisible(false); busy_=false; setInteractive(true);
-            statusTxt_->setText(QStringLiteral("Ready • %1 images • %2 groups").arg(images_.size()).arg(groups_.size()));
-            libraryStats_->setText(QStringLiteral("%1 images  •  %2 duplicate groups  •  representative matching")
-                                   .arg(images_.size()).arg(groups_.size()));
+            const bool exact=result.algo==HashAlgo::MD5;
+            const QString noun=exact ? QStringLiteral("files") : QStringLiteral("images");
+            statusTxt_->setText(QStringLiteral("Ready • %1 %2 • %3 groups")
+                                .arg(images_.size()).arg(noun).arg(groups_.size()));
+            libraryStats_->setText(QStringLiteral("%1 %2  •  %3 duplicate groups  •  %4")
+                                   .arg(images_.size()).arg(noun).arg(groups_.size())
+                                   .arg(exact ? QStringLiteral("exact matching")
+                                              : QStringLiteral("representative matching")));
             refillGroupsList();
             if (groupsList_->count()>0) groupsList_->setCurrentRow(0);
             else { clearThumbs(); headerLabel_->setText(QStringLiteral("No duplicate groups for these settings.")); }
@@ -1441,6 +1540,12 @@ private:
             catch (...) { out.error=QStringLiteral("Unknown background grouping failure."); }
             return out;
         }));
+    }
+
+    void rescanOrRegroup() {
+        if (busy_.load()) return;
+        if (!currentDir_.isEmpty()) startScan(currentDir_);
+        else regroup();
     }
 
     void regroup() {
@@ -1850,7 +1955,7 @@ private:
         QList<QWidget*> widgets = {
             groupsList_, sortCombo_, groupFilter_,
             algoCombo_,  thrSlider_, search_, sizeSlider_,
-            showSingles_, scanSubs_
+            showSingles_, scanSubs_, md5Images_, md5Videos_, md5Other_
         };
         for (QWidget* w : widgets) if (w) w->setEnabled(e);
         if (btnCancel_) { btnCancel_->setVisible(!e); btnCancel_->setEnabled(!e); }
@@ -2077,8 +2182,13 @@ private:
     QCheckBox*   scanSubs_{};
     QComboBox*   algoCombo_{};
     QLabel*      algoInfo_{};
+    QWidget*     thresholdRow_{};
+    QWidget*     md5TypesRow_{};
     QSlider*     thrSlider_{};
     QLabel*      thrLabel_{};
+    QCheckBox*   md5Images_{};
+    QCheckBox*   md5Videos_{};
+    QCheckBox*   md5Other_{};
     QSlider*     sizeSlider_{};
     QLabel*      thumbLabel_{};
     QPushButton* btnRegroup_{};
@@ -2091,6 +2201,7 @@ private:
     QLineEdit*    search_{};
     QLineEdit*    groupFilter_{};
     QComboBox*    sortCombo_{};
+    QTimer*        md5TypeTimer_{};
     QListWidget*  groupsList_{};
     QLabel*        libraryStats_{};
     QLabel*        galleryTitle_{};
