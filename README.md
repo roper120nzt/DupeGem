@@ -50,6 +50,19 @@ file has no usable preview, DupeGem develops it with LibRaw. This fallback is
 limited to two concurrent images to prevent large RAW files from exhausting
 memory.
 
+## Exact MD5 file categories
+
+Exact MD5 mode can scan three independently selectable categories:
+
+- **Images** — enabled by default and includes every image format listed above.
+- **Videos** — common formats including AVI, MKV, MOV, MP4, MPEG, MTS/M2TS,
+  WebM, WMV, FLV, 3GP, OGV, VOB, and related extensions.
+- **Other** — every readable file that is not classified as an image or video.
+
+Any combination can be enabled. Perceptual algorithms remain image-only.
+DupeGem's SQLite cache and its journal files are always excluded. MD5 content
+is still read only for files sharing the same byte size, regardless of category.
+
 ## Build prerequisites
 
 Install Qt 6, libheif, and thread-safe LibRaw in the same MSYS2 MinGW64
