@@ -7,6 +7,9 @@ namespace dg {
 
 inline constexpr int kBlake3DigestBytes = 32;
 inline constexpr int kExactPrehashVersion = 3;
+// A second distributed sample pass only pays for itself when avoiding a full
+// read would save at least roughly a megabyte.
+inline constexpr qint64 kDistributedSampleBytes = 1024 * 1024;
 
 struct FileIdentity {
     quint64 volumeSerial{};

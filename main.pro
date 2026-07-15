@@ -1,5 +1,5 @@
 QT += widgets concurrent sql
-VERSION = 0.4.0
+VERSION = 0.4.1
 SOURCES += main.cpp image_decoder.cpp exact_hash.cpp ntfs_journal.cpp \
     third_party/blake3/blake3.c \
     third_party/blake3/blake3_dispatch.c \

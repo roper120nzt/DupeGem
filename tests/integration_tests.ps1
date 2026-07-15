@@ -111,8 +111,24 @@ WHERE dhash IS NOT NULL AND phash IS NOT NULL AND ahash IS NOT NULL
     $hardlinks = Invoke-Benchmark 'md5' 'hardlink-filter'
     Assert-True ($hardlinks.hardlinks_skipped -ge 1) 'hardlink aliases skipped before hashing'
 
+    Copy-Item -LiteralPath (Join-Path $fixture 'image_0003.ppm') `
+        -Destination (Join-Path $fixture 'exact-copy.ppm')
+    $largeBytes = [byte[]]::new(2MB)
+    for ($position = 0; $position -lt $largeBytes.Length; $position++) {
+        $largeBytes[$position] = [byte](($position * 73 + 19) % 251)
+    }
+    [IO.File]::WriteAllBytes((Join-Path $fixture 'large-a.bin'), $largeBytes)
+    [IO.File]::WriteAllBytes((Join-Path $fixture 'large-b.bin'), $largeBytes)
+    $duplicates = Invoke-Benchmark 'md5' 'adaptive-exact-duplicates'
+    Assert-True ($duplicates.groups -ge 2) 'small and large exact duplicates formed groups'
+    Assert-True ((Invoke-Sqlite @'
+SELECT count(*) FROM images
+WHERE path IN ('image_0003.ppm','hardlink.ppm','exact-copy.ppm','large-a.bin','large-b.bin')
+  AND length(blake3)=32;
+'@) -eq '4') 'adaptive exact stages persisted BLAKE3 for true candidates'
+
     Write-Output ('Integration tests passed: migration, cancellation/resume, rename reuse, ' +
-                  'stale cleanup, and hardlink filtering.')
+                  'stale cleanup, hardlink filtering, and adaptive exact hashing.')
 }
 finally {
     foreach ($candidate in @($fixture, $results)) {

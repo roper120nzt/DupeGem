@@ -93,7 +93,7 @@ powershell -ExecutionPolicy Bypass -File .\package-portable.ps1
 The script creates:
 
 - `portable\DupeGem\DupeGem.exe` with the required Qt/MinGW DLLs and plugins.
-- `portable\DupeGem-v0.4.0-portable.zip` for distribution.
+- `portable\DupeGem-v0.4.1-portable.zip` for distribution.
 
 Windows Qt applications cannot be reduced to a literal single EXE when using
 the normal dynamic MSYS2 Qt packages. That requires compiling a separate static
@@ -115,8 +115,9 @@ scan.
 
 Exact Files is the default algorithm. It groups by size, removes hardlinks using
 Windows file IDs, checks the first/final 16 KiB with XXH3, then checks 16 KiB at
-25/50/75% only for survivors. Full SIMD-dispatched BLAKE3 runs only after both
-sample gates collide. Automatic bulk deletion does
+25/50/75% for surviving files of at least 1 MiB. Smaller candidates proceed
+directly from the first XXH3 collision to full SIMD-dispatched BLAKE3, avoiding
+an extra open. Automatic bulk deletion does
 a final byte-for-byte comparison before moving anything to the Recycle Bin.
 The selector is ordered roughly from fastest to slowest: Exact Files, aHash,
 dHash, wHash, bHash, then pHash. The internal legacy algorithm identifier remains
@@ -144,7 +145,7 @@ scaling and direct grayscale output. HEIF thumbnails and RAW embedded previews a
 preferred before full decoding.
 
 Exact-file reader limits adapt to the storage device: one reader on rotational
-media, two on a conventional SSD, and up to four on NVMe. The decoder pool uses
+media, up to four on a conventional SSD, and up to eight on NVMe. The decoder pool uses
 up to eight workers, with lower defaults on slower storage. Override the limits
 when benchmarking:
 
@@ -210,4 +211,6 @@ filesystem integration suite or a disposable 50,000-file cold/warm stress scan:
 ```powershell
 .\tests\integration_tests.ps1
 .\tests\stress_50000.ps1
+.\tests\exact_concurrency.ps1
+.\tests\gui_exact_smoke.ps1
 ```

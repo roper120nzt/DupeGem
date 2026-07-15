@@ -662,9 +662,21 @@ inline int exactWorkerCount(const QString& rootPath) {
     if (ok && requested>0) return std::clamp(requested,1,16);
     switch (storageClass(rootPath)) {
         case StorageClass::Rotational: return 1;
-        case StorageClass::SolidState: return std::min(2,workerCount());
-        case StorageClass::Nvme: return std::min(4,workerCount());
-        default: return std::min(2,workerCount());
+        case StorageClass::SolidState: return std::min(4,workerCount());
+        case StorageClass::Nvme: return workerCount();
+        default: return std::min(4,workerCount());
+    }
+}
+
+inline int exactSampleWorkerCount(const QString& rootPath) {
+    bool ok=false;
+    const int requested=qEnvironmentVariableIntValue("DUPEGEM_EXACT_THREADS",&ok);
+    if (ok && requested>0) return std::clamp(requested,1,16);
+    switch (storageClass(rootPath)) {
+        case StorageClass::Rotational: return std::min(2,workerCount());
+        case StorageClass::SolidState: return std::min(6,workerCount());
+        case StorageClass::Nvme: return workerCount();
+        default: return std::min(4,workerCount());
     }
 }
 
@@ -768,6 +780,15 @@ public:
     }
     bool isOpen() const { return db_.isOpen() && error_.isEmpty(); }
     QString error() const { return error_; }
+
+    bool hasRows() {
+        if (!isOpen()) return false;
+        QSqlQuery q(db_);
+        if (!q.exec(QStringLiteral("SELECT 1 FROM images LIMIT 1"))) {
+            error_=q.lastError().text(); return false;
+        }
+        return q.next();
+    }
 
     bool beginScanTracking() {
         if (!isOpen()) return false;
@@ -1102,6 +1123,7 @@ int runBenchmark(const QStringList& arguments) {
     for (const QString& extension:supportedImageExtensions()) imageTypes.insert(extension.toLower());
     SqliteCache cache(QDir(rootPath).absoluteFilePath(QStringLiteral(".dupegem_cache.sqlite")));
     const bool trackScan=cache.beginScanTracking();
+    const bool cacheHasRows=cache.hasRows();
     QStringList seenBatch;
     seenBatch.reserve(1000);
     const QDir root(rootPath);
@@ -1123,19 +1145,36 @@ int runBenchmark(const QStringList& arguments) {
             seenBatch << relative;
             if (seenBatch.size()>=1000) { cache.markSeen(seenBatch); seenBatch.clear(); }
         }
-        const QByteArray identity=fileIdentity(path).cacheKey();
-        if (!identity.isEmpty() && identities.contains(identity)) { ++hardlinksSkipped; continue; }
-        if (!identity.isEmpty()) identities.insert(identity);
         ImgMeta metadata;
         QString stored;
+        QByteArray identity;
+        bool identityCurrent=false;
         const auto lookupStart=std::chrono::steady_clock::now();
-        const bool found=cache.find(relative,identity,metadata,&stored);
+        bool found=false;
+        if (algorithm==HashAlgo::MD5) {
+            found=cache.find(relative,{},metadata,&stored);
+            if (found) identity=metadata.fileIdentity;
+            else if (cacheHasRows) {
+                identity=fileIdentity(path).cacheKey();
+                identityCurrent=!identity.isEmpty();
+                if (identityCurrent) found=cache.find(relative,identity,metadata,&stored);
+            }
+        } else {
+            identity=fileIdentity(path).cacheKey();
+            identityCurrent=!identity.isEmpty();
+            if (identityCurrent && identities.contains(identity)) { ++hardlinksSkipped; continue; }
+            if (identityCurrent) identities.insert(identity);
+            found=cache.find(relative,identity,metadata,&stored);
+        }
         cacheLookupNs+=std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now()-lookupStart).count();
         const qint64 mtime=info.lastModified().toMSecsSinceEpoch();
         const bool renamed=found && !stored.isEmpty() && stored!=relative;
         if (found && metadata.mtime==mtime && metadata.size==info.size()) ++cacheHits;
-        else metadata=ImgMeta{};
+        else {
+            metadata=ImgMeta{};
+            if (!identityCurrent) identity.clear();
+        }
         metadata.file=path; metadata.size=info.size(); metadata.mtime=mtime;
         metadata.fileIdentity=identity; metadata.valid=true;
         files.push_back(std::move(metadata));
@@ -1155,15 +1194,18 @@ int runBenchmark(const QStringList& arguments) {
         if (cancelOk && cancelAfter>0 && completed>=cancelAfter) benchmarkCancelled=true;
     };
     stage.restart();
+    std::vector<bool> benchmarkHardlinkAlias(files.size(),false);
     if (algorithm==HashAlgo::MD5) {
         QHash<qint64,QVector<int>> sizes;
         for (int i=0;i<int(files.size());++i) sizes[files[size_t(i)].size].push_back(i);
+        const int sampleReaders=exactSampleWorkerCount(rootPath);
+        const int fullReaders=exactWorkerCount(rootPath);
+        std::mutex byteMutex;
         std::vector<int> quick;
         for (auto bucket=sizes.cbegin();bucket!=sizes.cend();++bucket)
             if (bucket.value().size()>1) for (int index:bucket.value())
                 if (!files[size_t(index)].quickValid) quick.push_back(index);
-        std::mutex byteMutex;
-        runPersistentPipeline(quick.size(),exactWorkerCount(rootPath),benchmarkCancelled,
+        runPersistentPipeline(quick.size(),sampleReaders,benchmarkCancelled,
             [&](size_t position) {
                 const int index=quick[position];
                 const ExactHashResult result=quickSampleFile(files[size_t(index)].file);
@@ -1174,16 +1216,48 @@ int runBenchmark(const QStringList& arguments) {
                 noteOperation();
                 return index;
             },[&](const std::vector<int>& rows){changed.insert(changed.end(),rows.begin(),rows.end());});
-        std::vector<int> samples;
+        std::vector<int> identityCandidates;
         for (auto bucket=sizes.cbegin();bucket!=sizes.cend();++bucket) {
             QHash<quint64,QVector<int>> quickGroups;
             for (int index:bucket.value()) if (files[size_t(index)].quickValid)
                 quickGroups[files[size_t(index)].quickHash].push_back(index);
             for (auto group=quickGroups.cbegin();group!=quickGroups.cend();++group)
+                if (group.value().size()>1)
+                    for (int index:group.value()) identityCandidates.push_back(index);
+        }
+        std::sort(identityCandidates.begin(),identityCandidates.end());
+        identityCandidates.erase(std::unique(identityCandidates.begin(),identityCandidates.end()),
+                                 identityCandidates.end());
+        std::vector<int> missingIdentities;
+        for (int index:identityCandidates)
+            if (files[size_t(index)].fileIdentity.isEmpty()) missingIdentities.push_back(index);
+        runPersistentPipeline(missingIdentities.size(),sampleReaders,benchmarkCancelled,
+            [&](size_t position) {
+                const int index=missingIdentities[position];
+                files[size_t(index)].fileIdentity=fileIdentity(files[size_t(index)].file).cacheKey();
+                return files[size_t(index)].fileIdentity.isEmpty() ? -1 : index;
+            },[&](const std::vector<int>& rows){changed.insert(changed.end(),rows.begin(),rows.end());});
+        QSet<QByteArray> candidateIdentities;
+        for (int index:identityCandidates) {
+            const QByteArray& identity=files[size_t(index)].fileIdentity;
+            if (identity.isEmpty()) continue;
+            if (candidateIdentities.contains(identity)) {
+                benchmarkHardlinkAlias[size_t(index)]=true;
+                ++hardlinksSkipped;
+            } else candidateIdentities.insert(identity);
+        }
+        std::vector<int> samples;
+        for (auto bucket=sizes.cbegin();bucket!=sizes.cend();++bucket) {
+            if (bucket.key()<kDistributedSampleBytes) continue;
+            QHash<quint64,QVector<int>> quickGroups;
+            for (int index:bucket.value())
+                if (!benchmarkHardlinkAlias[size_t(index)] && files[size_t(index)].quickValid)
+                quickGroups[files[size_t(index)].quickHash].push_back(index);
+            for (auto group=quickGroups.cbegin();group!=quickGroups.cend();++group)
                 if (group.value().size()>1) for (int index:group.value())
                     if (!files[size_t(index)].sampleValid) samples.push_back(index);
         }
-        runPersistentPipeline(samples.size(),exactWorkerCount(rootPath),benchmarkCancelled,
+        runPersistentPipeline(samples.size(),sampleReaders,benchmarkCancelled,
             [&](size_t position) {
                 const int index=samples[position];
                 const ExactHashResult result=sampleFile(files[size_t(index)].file);
@@ -1196,19 +1270,30 @@ int runBenchmark(const QStringList& arguments) {
             },[&](const std::vector<int>& rows){changed.insert(changed.end(),rows.begin(),rows.end());});
         std::vector<int> full;
         for (auto bucket=sizes.cbegin();bucket!=sizes.cend();++bucket) {
-            QHash<QByteArray,QVector<int>> prehashes;
-            for (int index:bucket.value()) if (files[size_t(index)].quickValid
-                                                && files[size_t(index)].sampleValid) {
-                QByteArray key(16,Qt::Uninitialized);
-                std::memcpy(key.data(),&files[size_t(index)].quickHash,8);
-                std::memcpy(key.data()+8,&files[size_t(index)].sampleHash,8);
-                prehashes[key].push_back(index);
+            if (bucket.key()<kDistributedSampleBytes) {
+                QHash<quint64,QVector<int>> quickGroups;
+                for (int index:bucket.value())
+                    if (!benchmarkHardlinkAlias[size_t(index)] && files[size_t(index)].quickValid)
+                    quickGroups[files[size_t(index)].quickHash].push_back(index);
+                for (auto group=quickGroups.cbegin();group!=quickGroups.cend();++group)
+                    if (group.value().size()>1) for (int index:group.value())
+                        if (files[size_t(index)].blake3.size()!=kBlake3DigestBytes) full.push_back(index);
+            } else {
+                QHash<QByteArray,QVector<int>> prehashes;
+                for (int index:bucket.value()) if (!benchmarkHardlinkAlias[size_t(index)]
+                                                    && files[size_t(index)].quickValid
+                                                    && files[size_t(index)].sampleValid) {
+                    QByteArray key(16,Qt::Uninitialized);
+                    std::memcpy(key.data(),&files[size_t(index)].quickHash,8);
+                    std::memcpy(key.data()+8,&files[size_t(index)].sampleHash,8);
+                    prehashes[key].push_back(index);
+                }
+                for (auto prehash=prehashes.cbegin();prehash!=prehashes.cend();++prehash)
+                    if (prehash.value().size()>1) for (int index:prehash.value())
+                        if (files[size_t(index)].blake3.size()!=kBlake3DigestBytes) full.push_back(index);
             }
-            for (auto prehash=prehashes.cbegin();prehash!=prehashes.cend();++prehash)
-                if (prehash.value().size()>1) for (int index:prehash.value())
-                    if (files[size_t(index)].blake3.size()!=kBlake3DigestBytes) full.push_back(index);
         }
-        runPersistentPipeline(full.size(),exactWorkerCount(rootPath),benchmarkCancelled,
+        runPersistentPipeline(full.size(),fullReaders,benchmarkCancelled,
             [&](size_t position) {
                 const int index=full[position];
                 const ExactHashResult result=hashFileBlake3(files[size_t(index)].file);
@@ -1253,7 +1338,9 @@ int runBenchmark(const QStringList& arguments) {
     int groupCount=0;
     if (!benchmarkCancelled && algorithm==HashAlgo::MD5) {
         QHash<QByteArray,int> counts;
-        for (const ImgMeta& file:files) if (file.blake3.size()==kBlake3DigestBytes) {
+        for (size_t i=0;i<files.size();++i) {
+            const ImgMeta& file=files[i];
+            if (benchmarkHardlinkAlias[i] || file.blake3.size()!=kBlake3DigestBytes) continue;
             QByteArray key(sizeof(qint64),Qt::Uninitialized);
             std::memcpy(key.data(),&file.size,sizeof(file.size));
             key+=file.blake3;
@@ -2096,6 +2183,7 @@ private:
                     }
                 }
                 const bool trackFullScan=!journalFastPath && cache.beginScanTracking();
+                const bool cacheHasRows=cache.hasRows();
                 QStringList seenBatch;
                 seenBatch.reserve(1000);
                 if (!cache.isOpen()) out.cacheWarning=cache.error();
@@ -2204,12 +2292,6 @@ private:
                     if (path.isEmpty() || !withinRoot(path) || !acceptedPath(path)) return;
                     const QFileInfo candidate(path);
                     if (!candidate.isFile() || !candidate.isReadable()) return;
-                    const QByteArray identity=fileIdentity(path).cacheKey();
-                    if (!identity.isEmpty()) {
-                        if (identities.contains(identity)) return;
-                        identities.insert(identity);
-                    }
-
                     const QString relative=root.relativeFilePath(path);
                     if (trackFullScan) {
                         seenBatch << relative;
@@ -2220,11 +2302,38 @@ private:
                     }
                     ImgMeta metadata;
                     QString storedPath;
-                    const bool found=cache.find(relative,identity,metadata,&storedPath);
+                    QByteArray identity;
+                    bool identityCurrent=false;
+                    bool found=false;
+                    if (algo==HashAlgo::MD5) {
+                        // The path lookup is enough for normal cached files. A
+                        // native file-ID lookup opens another handle, so only
+                        // pay for it on a miss when an existing cache could
+                        // contain the same file under an old name.
+                        found=cache.find(relative,{},metadata,&storedPath);
+                        if (found) identity=metadata.fileIdentity;
+                        else if (cacheHasRows) {
+                            identity=fileIdentity(path).cacheKey();
+                            identityCurrent=!identity.isEmpty();
+                            if (identityCurrent)
+                                found=cache.find(relative,identity,metadata,&storedPath);
+                        }
+                    } else {
+                        identity=fileIdentity(path).cacheKey();
+                        identityCurrent=!identity.isEmpty();
+                        if (identityCurrent) {
+                            if (identities.contains(identity)) return;
+                            identities.insert(identity);
+                        }
+                        found=cache.find(relative,identity,metadata,&storedPath);
+                    }
                     const qint64 mtime=candidate.lastModified().toMSecsSinceEpoch();
                     const bool metadataHit=found && metadata.mtime==mtime
                         && metadata.size==candidate.size() && !contentChanged;
-                    if (!metadataHit) metadata=ImgMeta{};
+                    if (!metadataHit) {
+                        metadata=ImgMeta{};
+                        if (!identityCurrent) identity.clear();
+                    }
                     metadata.file=path;
                     metadata.size=candidate.size();
                     metadata.mtime=mtime;
@@ -2389,16 +2498,17 @@ private:
                 if (algo==HashAlgo::MD5) {
                     QHash<qint64,QVector<int>> bySize; bySize.reserve(n*2);
                     for (int i=0;i<n;++i) bySize[out.images[size_t(i)].size].push_back(i);
+                    const int sampleReaders=exactSampleWorkerCount(root);
+                    const int fullReaders=exactWorkerCount(root);
                     std::vector<int> pendingQuick;
                     for (auto it=bySize.cbegin();it!=bySize.cend();++it)
                         if (it.value().size()>1)
                             for (int i:it.value())
                                 if (!out.images[size_t(i)].quickValid) pendingQuick.push_back(i);
 
-                    const int readers=exactWorkerCount(root);
                     std::atomic<int> quickDone{0};
                     post(QStringLiteral("Checking first and last 16 KiB with XXH3..."),0,int(pendingQuick.size()));
-                    runPersistentPipeline(pendingQuick.size(),readers,cancelled_,
+                    runPersistentPipeline(pendingQuick.size(),sampleReaders,cancelled_,
                         [&](size_t position) {
                             const int index=pendingQuick[position];
                             const ExactHashResult result=quickSampleFile(out.images[size_t(index)].file);
@@ -2414,10 +2524,52 @@ private:
                         },saveCheckpoint);
                     if (cancelled_) { out.cancelled=true; return out; }
 
-                    std::vector<int> pendingSamples;
+                    std::vector<bool> hardlinkAlias(size_t(n),false);
+                    std::vector<int> potentialLarge;
                     for (auto sizeBucket=bySize.cbegin();sizeBucket!=bySize.cend();++sizeBucket) {
+                        if (sizeBucket.key()<kDistributedSampleBytes) continue;
                         QHash<quint64,QVector<int>> quickGroups;
                         for (int index:sizeBucket.value()) if (out.images[size_t(index)].quickValid)
+                            quickGroups[out.images[size_t(index)].quickHash].push_back(index);
+                        for (auto group=quickGroups.cbegin();group!=quickGroups.cend();++group)
+                            if (group.value().size()>1)
+                                for (int index:group.value()) potentialLarge.push_back(index);
+                    }
+                    std::sort(potentialLarge.begin(),potentialLarge.end());
+                    potentialLarge.erase(std::unique(potentialLarge.begin(),potentialLarge.end()),
+                                         potentialLarge.end());
+                    std::vector<int> pendingIdentity;
+                    for (int index:potentialLarge)
+                        if (out.images[size_t(index)].fileIdentity.isEmpty()) pendingIdentity.push_back(index);
+                    std::atomic<int> identitiesDone{0};
+                    post(QStringLiteral("Checking hardlinks among hash candidates..."),
+                         0,int(pendingIdentity.size()));
+                    runPersistentPipeline(pendingIdentity.size(),sampleReaders,cancelled_,
+                        [&](size_t position) {
+                            const int index=pendingIdentity[position];
+                            out.images[size_t(index)].fileIdentity=
+                                fileIdentity(out.images[size_t(index)].file).cacheKey();
+                            const int count=++identitiesDone;
+                            if ((count&127)==0 || count==int(pendingIdentity.size()))
+                                post(QStringLiteral("File identities • %1 / %2")
+                                     .arg(count).arg(pendingIdentity.size()),count,int(pendingIdentity.size()));
+                            return out.images[size_t(index)].fileIdentity.isEmpty() ? -1 : index;
+                        },saveCheckpoint);
+                    if (cancelled_) { out.cancelled=true; return out; }
+                    QSet<QByteArray> seenCandidateIdentities;
+                    for (int index:potentialLarge) {
+                        const QByteArray& identity=out.images[size_t(index)].fileIdentity;
+                        if (identity.isEmpty()) continue;
+                        if (seenCandidateIdentities.contains(identity)) hardlinkAlias[size_t(index)]=true;
+                        else seenCandidateIdentities.insert(identity);
+                    }
+
+                    std::vector<int> pendingSamples;
+                    for (auto sizeBucket=bySize.cbegin();sizeBucket!=bySize.cend();++sizeBucket) {
+                        if (sizeBucket.key()<kDistributedSampleBytes) continue;
+                        QHash<quint64,QVector<int>> quickGroups;
+                        for (int index:sizeBucket.value())
+                            if (!hardlinkAlias[size_t(index)] && out.images[size_t(index)].quickValid)
                             quickGroups[out.images[size_t(index)].quickHash].push_back(index);
                         for (auto group=quickGroups.cbegin();group!=quickGroups.cend();++group)
                             if (group.value().size()>1) for (int index:group.value())
@@ -2425,7 +2577,7 @@ private:
                     }
                     std::atomic<int> sampled{0};
                     post(QStringLiteral("Checking distributed 25/50/75% samples..."),0,int(pendingSamples.size()));
-                    runPersistentPipeline(pendingSamples.size(),readers,cancelled_,
+                    runPersistentPipeline(pendingSamples.size(),sampleReaders,cancelled_,
                         [&](size_t position) {
                             const int index=pendingSamples[position];
                             const ExactHashResult result=sampleFile(out.images[size_t(index)].file);
@@ -2444,27 +2596,40 @@ private:
                     std::vector<int> pendingFull;
                     for (auto sizeBucket=bySize.cbegin();sizeBucket!=bySize.cend();++sizeBucket) {
                         if (sizeBucket.value().size()<2) continue;
-                        QHash<QByteArray,QVector<int>> samples;
-                        for (int index:sizeBucket.value()) {
-                            const ImgMeta& image=out.images[size_t(index)];
-                            if (image.quickValid && image.sampleValid) {
-                                QByteArray key(16,Qt::Uninitialized);
-                                std::memcpy(key.data(),&image.quickHash,8);
-                                std::memcpy(key.data()+8,&image.sampleHash,8);
-                                samples[key].push_back(index);
+                        if (sizeBucket.key()<kDistributedSampleBytes) {
+                            QHash<quint64,QVector<int>> quickGroups;
+                            for (int index:sizeBucket.value()) {
+                                const ImgMeta& image=out.images[size_t(index)];
+                                if (!hardlinkAlias[size_t(index)] && image.quickValid)
+                                    quickGroups[image.quickHash].push_back(index);
                             }
-                        }
-                        for (auto sample=samples.cbegin();sample!=samples.cend();++sample) {
-                            if (sample.value().size()<2) continue;
-                            for (int index:sample.value())
-                                if (out.images[size_t(index)].blake3.size()!=kBlake3DigestBytes)
-                                    pendingFull.push_back(index);
+                            for (auto group=quickGroups.cbegin();group!=quickGroups.cend();++group)
+                                if (group.value().size()>1) for (int index:group.value())
+                                    if (out.images[size_t(index)].blake3.size()!=kBlake3DigestBytes)
+                                        pendingFull.push_back(index);
+                        } else {
+                            QHash<QByteArray,QVector<int>> samples;
+                            for (int index:sizeBucket.value()) {
+                                const ImgMeta& image=out.images[size_t(index)];
+                                if (!hardlinkAlias[size_t(index)] && image.quickValid && image.sampleValid) {
+                                    QByteArray key(16,Qt::Uninitialized);
+                                    std::memcpy(key.data(),&image.quickHash,8);
+                                    std::memcpy(key.data()+8,&image.sampleHash,8);
+                                    samples[key].push_back(index);
+                                }
+                            }
+                            for (auto sample=samples.cbegin();sample!=samples.cend();++sample) {
+                                if (sample.value().size()<2) continue;
+                                for (int index:sample.value())
+                                    if (out.images[size_t(index)].blake3.size()!=kBlake3DigestBytes)
+                                        pendingFull.push_back(index);
+                            }
                         }
                     }
 
                     std::atomic<int> fullyHashed{0};
                     post(QStringLiteral("Hashing remaining candidates with BLAKE3..."),0,int(pendingFull.size()));
-                    runPersistentPipeline(pendingFull.size(),readers,cancelled_,
+                    runPersistentPipeline(pendingFull.size(),fullReaders,cancelled_,
                         [&](size_t position) {
                             const int index=pendingFull[position];
                             const ExactHashResult result=hashFileBlake3(out.images[size_t(index)].file);
@@ -2476,6 +2641,53 @@ private:
                             return result.ok ? index : -1;
                         },saveCheckpoint);
                     if (cancelled_) { out.cancelled=true; return out; }
+
+                    // For tiny files, opening a native handle before hashing is
+                    // more expensive than hashing. Check identities only for
+                    // actual BLAKE3 matches so unique small files pay no cost.
+                    std::vector<int> potentialSmall;
+                    for (auto sizeBucket=bySize.cbegin();sizeBucket!=bySize.cend();++sizeBucket) {
+                        if (sizeBucket.key()>=kDistributedSampleBytes) continue;
+                        QHash<QByteArray,QVector<int>> hashes;
+                        for (int index:sizeBucket.value()) {
+                            const QByteArray& digest=out.images[size_t(index)].blake3;
+                            if (digest.size()==kBlake3DigestBytes) hashes[digest].push_back(index);
+                        }
+                        for (auto group=hashes.cbegin();group!=hashes.cend();++group)
+                            if (group.value().size()>1)
+                                for (int index:group.value()) potentialSmall.push_back(index);
+                    }
+                    std::sort(potentialSmall.begin(),potentialSmall.end());
+                    potentialSmall.erase(std::unique(potentialSmall.begin(),potentialSmall.end()),
+                                         potentialSmall.end());
+                    pendingIdentity.clear();
+                    for (int index:potentialSmall)
+                        if (out.images[size_t(index)].fileIdentity.isEmpty()) pendingIdentity.push_back(index);
+                    identitiesDone=0;
+                    runPersistentPipeline(pendingIdentity.size(),sampleReaders,cancelled_,
+                        [&](size_t position) {
+                            const int index=pendingIdentity[position];
+                            out.images[size_t(index)].fileIdentity=
+                                fileIdentity(out.images[size_t(index)].file).cacheKey();
+                            ++identitiesDone;
+                            return out.images[size_t(index)].fileIdentity.isEmpty() ? -1 : index;
+                        },saveCheckpoint);
+                    if (cancelled_) { out.cancelled=true; return out; }
+                    for (int index:potentialSmall) {
+                        const QByteArray& identity=out.images[size_t(index)].fileIdentity;
+                        if (identity.isEmpty()) continue;
+                        if (seenCandidateIdentities.contains(identity)) hardlinkAlias[size_t(index)]=true;
+                        else seenCandidateIdentities.insert(identity);
+                    }
+
+                    if (std::any_of(hardlinkAlias.begin(),hardlinkAlias.end(),[](bool alias){return alias;})) {
+                        std::vector<ImgMeta> filtered;
+                        filtered.reserve(out.images.size());
+                        for (int i=0;i<n;++i)
+                            if (!hardlinkAlias[size_t(i)]) filtered.push_back(std::move(out.images[size_t(i)]));
+                        out.images=std::move(filtered);
+                        n=int(out.images.size());
+                    }
 
                     QHash<QByteArray,std::vector<int>> exact;
                     for (int i=0;i<n;++i) {
@@ -3281,7 +3493,7 @@ private:
 int main(int argc, char *argv[]) {
     qInstallMessageHandler(dg::qtMessageHandler);
     QCoreApplication::setApplicationName(QStringLiteral("DupeGem"));
-    QCoreApplication::setApplicationVersion(QStringLiteral("0.4.0"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("0.4.1"));
     QCoreApplication::setOrganizationName(QStringLiteral("DupeGem"));
     bool imageLimitOk=false;
     int imageLimitMb=qEnvironmentVariableIntValue("DUPEGEM_IMAGE_LIMIT_MB", &imageLimitOk);

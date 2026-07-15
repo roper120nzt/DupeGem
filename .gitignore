@@ -26,3 +26,5 @@
 !tests/performance_tests.pro
 !tests/integration_tests.ps1
 !tests/stress_50000.ps1
+!tests/exact_concurrency.ps1
+!tests/gui_exact_smoke.ps1
