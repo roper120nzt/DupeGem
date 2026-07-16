@@ -106,6 +106,9 @@ GUI thread. The Cancel button remains available during long scans, and thumbnail
 cards are created in small batches as they enter the gallery rather than creating
 tens of thousands of widgets at once.
 
+Click a thumbnail preview to select or unselect that file. The checkbox remains
+available and always reflects the same selection state.
+
 DupeGem stores scan metadata and hashes in a `.dupegem_cache.sqlite` file inside
 each scanned folder. Only the selected algorithm is calculated initially. When
 you switch algorithms, its missing hashes are calculated once and persisted, so

@@ -30,6 +30,7 @@
 #include <QListWidget>
 #include <QMessageBox>
 #include <QMetaObject>
+#include <QMouseEvent>
 #include <QMovie>
 #include <QPointer>
 #include <QProgressBar>
@@ -636,6 +637,9 @@ public:
 
         img_ = new QLabel(this);
         img_->setAlignment(Qt::AlignCenter);
+        img_->setCursor(Qt::PointingHandCursor);
+        img_->setToolTip(QStringLiteral("Click the thumbnail to select or unselect this file."));
+        img_->installEventFilter(this);
 
         int w = isSupportedVideoFile(meta_.file) ? qRound(thumbH_ * 16.0 / 9.0) : thumbH_;
         if (meta_.resolution.isValid() && meta_.resolution.height() > 0) {
@@ -676,6 +680,20 @@ public:
     QString filePath() const { return meta_.file; }
     void setChecked(bool b) { check_->setChecked(b); }
 
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override {
+        if (watched==img_ && event->type()==QEvent::MouseButtonRelease) {
+            const auto* mouseEvent=static_cast<QMouseEvent*>(event);
+            if (mouseEvent->button()==Qt::LeftButton
+                && img_->rect().contains(mouseEvent->position().toPoint())) {
+                check_->toggle();
+                return true;
+            }
+        }
+        return QWidget::eventFilter(watched,event);
+    }
+
+public:
     void updateInfo() {
         if (leader_.file.isEmpty()) { info_->clear(); return; }
 
@@ -2242,6 +2260,8 @@ int main(int argc, char *argv[]) {
     if (!imageLimitOk || imageLimitMb<32) imageLimitMb=128;
     QImageReader::setAllocationLimit(std::clamp(imageLimitMb, 32, 4096));
     QApplication app(argc, argv);
+    QCoreApplication::setApplicationName(QStringLiteral("DupeGem"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("0.3.3"));
     dg::DupeGemMainWindow w;
     w.show();
     if (argc>1) {
