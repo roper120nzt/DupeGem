@@ -2260,6 +2260,8 @@ int main(int argc, char *argv[]) {
     if (!imageLimitOk || imageLimitMb<32) imageLimitMb=128;
     QImageReader::setAllocationLimit(std::clamp(imageLimitMb, 32, 4096));
     QApplication app(argc, argv);
+    QCoreApplication::setApplicationName(QStringLiteral("DupeGem"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("0.3.3"));
     dg::DupeGemMainWindow w;
     w.show();
     if (argc>1) {
