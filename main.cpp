@@ -779,7 +779,14 @@ private:
                                   : QStringLiteral("Preview unavailable"));
                 img_->setStyleSheet(QStringLiteral("color:#f87171;"));
             }
-            else { img_->setText({}); img_->setPixmap(QPixmap::fromImage(image)); }
+            else {
+                img_->setText({});
+                // Always fit the complete preview inside its label. The decoder
+                // normally returns this exact size, while this final guard also
+                // handles inaccurate metadata and third-party codec output.
+                img_->setPixmap(QPixmap::fromImage(image).scaled(
+                    img_->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+            }
             if (bigGif) { gifInfo_=QStringLiteral("Large GIF • animation disabled"); updateInfo(); }
         });
         watcher->setFuture(QtConcurrent::run([path,height]{
@@ -922,7 +929,7 @@ public:
             auto* row = new QHBoxLayout;
             row->addWidget(new QLabel(QStringLiteral("Thumbnail Preview Height:")));
             sizeSlider_ = new QSlider(Qt::Horizontal);
-            sizeSlider_->setRange(140, 720);
+            sizeSlider_->setRange(140, 850);
             sizeSlider_->setValue(240);
             row->addWidget(sizeSlider_, 1);
             thumbLabel_ = new QLabel(QStringLiteral("240 px"));
@@ -2354,7 +2361,7 @@ int main(int argc, char *argv[]) {
     QImageReader::setAllocationLimit(std::clamp(imageLimitMb, 32, 4096));
     QApplication app(argc, argv);
     QCoreApplication::setApplicationName(QStringLiteral("DupeGem"));
-    QCoreApplication::setApplicationVersion(QStringLiteral("0.4.6"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("0.4.7"));
     dg::DupeGemMainWindow w;
     w.show();
     if (argc>1) {
