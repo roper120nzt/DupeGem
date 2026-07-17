@@ -132,7 +132,11 @@ QImage applyRawOrientation(QImage image, int flip) {
 }
 
 QSize requestedSize(const QSize& source, const QSize& target, Qt::AspectRatioMode mode) {
-    if (!source.isValid() || target.isEmpty()) return target;
+    // A zero width or height means "derive this dimension from the source
+    // aspect ratio". QSize::isEmpty() treats either zero dimension as empty,
+    // which caused height-only thumbnail requests such as QSize(0, 240) to
+    // bypass scaling and leave the full-resolution image cropped by QLabel.
+    if (!source.isValid() || (target.width() <= 0 && target.height() <= 0)) return target;
     if (target.width() <= 0 && target.height() > 0)
         return QSize(std::max(1, qRound(double(source.width()) * target.height() / source.height())),
                      target.height());
@@ -143,7 +147,7 @@ QSize requestedSize(const QSize& source, const QSize& target, Qt::AspectRatioMod
 }
 
 QImage finishScale(QImage image, const QSize& target, Qt::AspectRatioMode mode) {
-    if (image.isNull() || target.isEmpty()) return image;
+    if (image.isNull() || (target.width() <= 0 && target.height() <= 0)) return image;
     const QSize wanted = requestedSize(image.size(), target, mode);
     if (!wanted.isValid() || wanted == image.size()) return image;
     return image.scaled(wanted, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
