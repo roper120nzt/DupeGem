@@ -24,7 +24,7 @@ Given a 39,668 image dataset
 
 | Tool and version       | Method                         |      Time | Relative time | Successfully processed | Images/sec |     Peak memory |
 | ---------------------- | ------------------------------ | --------: | ------------: | ---------------------: | ---------: | --------------: |
-| **DupeGem 0.4.7**      | 256-bit dHash, distance 4      | **9m37s** |     **1.00×** |             **39,668** |  **68.71** | **1,505.7 MiB** |
+| **DupeGem 0.4.8**      | 256-bit dHash, distance 4      | **9m37s** |     **1.00×** |             **39,668** |  **68.71** | **1,505.7 MiB** |
 | Czkawka CLI 12.0.0     | 256-bit Gradient, distance 4   |    12m21s |         1.28× |                 37,454 |      50.56 |     1,162.4 MiB |
 | imagededup 0.3.3.post2 | 64-bit dHash, distance 4       |    18m22s |         1.91× |                 39,664 |      36.00 |     5,160.0 MiB |
 | photodedupe 1.0.7      | Colour-difference matcher      |    24m42s |         2.57× |                 39,652 |      26.75 |     1,145.2 MiB |
