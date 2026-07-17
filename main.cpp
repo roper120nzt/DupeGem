@@ -821,8 +821,8 @@ public:
         controlsW_ = new QFrame;
         controlsW_->setObjectName(QStringLiteral("sidePanel"));
         auto* ctl = new QVBoxLayout(controlsW_);
-        ctl->setContentsMargins(18,18,18,18);
-        ctl->setSpacing(10);
+        ctl->setContentsMargins(16,16,16,16);
+        ctl->setSpacing(8);
 
         auto* brand=new QLabel(QStringLiteral("DupeGem"));
         brand->setObjectName(QStringLiteral("brandTitle"));
@@ -832,7 +832,7 @@ public:
 
         auto addSection=[ctl](const QString& text){
             auto* label=new QLabel(text.toUpper()); label->setObjectName(QStringLiteral("sectionTitle"));
-            ctl->addSpacing(8); ctl->addWidget(label);
+            ctl->addSpacing(6); ctl->addWidget(label);
         };
         addSection(QStringLiteral("Library"));
 
@@ -954,16 +954,18 @@ public:
     // Wrap the button in a small container so we can add vertical padding
     auto* deleteWrap = new QWidget;
     auto* deleteVL   = new QVBoxLayout(deleteWrap);
-    deleteVL->setContentsMargins(0, 8, 0, 4);
+    deleteVL->setContentsMargins(0, 5, 0, 3);
     deleteVL->setSpacing(0);
 
     auto* deleteRow = new QHBoxLayout;
     deleteRow->setContentsMargins(0, 0, 0, 0);
-    deleteRow->setSpacing(8);
+    deleteRow->setSpacing(6);
 
-    btnDelete_ = new QPushButton(QStringLiteral("Delete Selected"));
+    btnDelete_ = new QPushButton(QStringLiteral("Delete Selected From Group"));
     btnDelete_->setObjectName(QStringLiteral("dangerButton"));
     btnDelete_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+    btnDelete_->setToolTip(QStringLiteral(
+        "Move checkmarked files from the currently displayed group to the Recycle Bin."));
 
     // Make it visually larger & bolder
     QFont df = btnDelete_->font();
@@ -974,17 +976,28 @@ public:
     // Double the button's height
     btnDelete_->setMinimumHeight(btnDelete_->sizeHint().height() * 1.2);
 
-    btnDeleteAllGroups_ = new QPushButton(QStringLiteral("Delete From All Groups…"));
+    QFont secondaryDeleteFont=QApplication::font();
+    secondaryDeleteFont.setBold(true);
+
+    btnDeleteSelectedAllGroups_ = new QPushButton(QStringLiteral("Delete Selected From All Groups"));
+    btnDeleteSelectedAllGroups_->setObjectName(QStringLiteral("secondaryDangerButton"));
+    btnDeleteSelectedAllGroups_->setToolTip(QStringLiteral(
+        "Move every manually checkmarked file across all duplicate groups to the Recycle Bin."));
+    btnDeleteSelectedAllGroups_->setFont(secondaryDeleteFont);
+    btnDeleteSelectedAllGroups_->setMinimumHeight(btnDelete_->minimumHeight());
+
+    btnDeleteAllGroups_ = new QPushButton(QStringLiteral("Auto Select/Delete From All Groups"));
     btnDeleteAllGroups_->setObjectName(QStringLiteral("secondaryDangerButton"));
     btnDeleteAllGroups_->setToolTip(QStringLiteral(
-        "MD5 only: keep one file in every exact-match group and move the rest to the Recycle Bin."));
-    btnDeleteAllGroups_->setFont(df);
+        "Automatically keep one file in every MD5 exact-match group and move the rest to the Recycle Bin."));
+    btnDeleteAllGroups_->setFont(secondaryDeleteFont);
     btnDeleteAllGroups_->setMinimumHeight(btnDelete_->minimumHeight());
-    btnDeleteAllGroups_->setVisible(false);
 
     deleteRow->addWidget(btnDelete_, 1);
-    deleteRow->addWidget(btnDeleteAllGroups_, 1);
+    deleteRow->addWidget(btnDeleteSelectedAllGroups_, 1);
     deleteVL->addLayout(deleteRow);
+    deleteVL->addSpacing(5);
+    deleteVL->addWidget(btnDeleteAllGroups_);
     ctl->addWidget(deleteWrap);
 }
 
@@ -1055,7 +1068,7 @@ public:
 
         // Keep the complete control deck stable and fully visible. The window
         // minimum size guarantees the fixed deck never needs a scrollbar.
-        controlsW_->setFixedSize(514,800);
+        controlsW_->setFixedSize(514,750);
         controlsW_->setSizePolicy(QSizePolicy::Fixed,QSizePolicy::Fixed);
         leftSplit_->setChildrenCollapsible(false);
         leftSplit_->addWidget(controlsW_);
@@ -1067,12 +1080,12 @@ public:
 
         // The groups list owns all space beneath the fixed control deck.
         QList<int> initSizes;
-        initSizes << 800     // fixed settings-panel height
-                  << 120;    // groups pane receives remaining height
+        initSizes << 750     // compact fixed settings-panel height
+                  << 170;    // groups pane receives the reclaimed space
         leftSplit_->setSizes(initSizes);
         QTimer::singleShot(0,this,[this]{
-            const int groupHeight=std::max(80,leftSplit_->height()-800-leftSplit_->handleWidth());
-            leftSplit_->setSizes({800,groupHeight});
+            const int groupHeight=std::max(80,leftSplit_->height()-750-leftSplit_->handleWidth());
+            leftSplit_->setSizes({750,groupHeight});
         });
 
         // ==== RIGHT: image grid viewer ====
@@ -1137,7 +1150,10 @@ connect(scBksp, &QShortcut::activated, this, [this]{
         connect(btnSelect_, &QPushButton::clicked, this, &DupeGemMainWindow::selectFolder);
         connect(btnRegroup_,&QPushButton::clicked, this, &DupeGemMainWindow::rescanOrRegroup);
         connect(btnDelete_, &QPushButton::clicked, this, &DupeGemMainWindow::deleteSelected);
-        connect(btnDeleteAllGroups_, &QPushButton::clicked, this, &DupeGemMainWindow::deleteAllMd5Duplicates);
+        connect(btnDeleteSelectedAllGroups_,&QPushButton::clicked,
+                this,&DupeGemMainWindow::deleteSelectedFromAllGroups);
+        connect(btnDeleteAllGroups_,&QPushButton::clicked,
+                this,&DupeGemMainWindow::deleteAllMd5Duplicates);
         connect(btnCancel_,&QPushButton::clicked,this,[this]{ cancelled_=true; statusTxt_->setText(QStringLiteral("Cancelling safely…")); btnCancel_->setEnabled(false); });
 
         connect(groupsList_, &QListWidget::currentRowChanged, this, &DupeGemMainWindow::groupChosen);
@@ -1598,6 +1614,55 @@ private:
         refreshAfterDelete();
     }
 
+    void deleteSelectedFromAllGroups() {
+        if (busy_.load()) return;
+
+        QStringList toDelete;
+        QSet<int> included;
+        int affectedGroups=0;
+        int emptiedGroups=0;
+        for (const auto& group:groups_) {
+            int existing=0;
+            int selected=0;
+            for (int idx:group) {
+                if (idx<0 || idx>=int(images_.size()) || images_[size_t(idx)].file.isEmpty()) continue;
+                ++existing;
+                if (!images_[size_t(idx)].selected) continue;
+                ++selected;
+                if (!included.contains(idx)) {
+                    included.insert(idx);
+                    toDelete << images_[size_t(idx)].file;
+                }
+            }
+            if (selected>0) {
+                ++affectedGroups;
+                if (selected==existing) ++emptiedGroups;
+            }
+        }
+
+        if (toDelete.isEmpty()) {
+            QMessageBox::information(this,QStringLiteral("Delete Selected From All Groups"),
+                QStringLiteral("No files are selected in the current duplicate groups."));
+            return;
+        }
+
+        QMessageBox confirm(QMessageBox::Warning,
+            QStringLiteral("Confirm Cross-Group Delete"),
+            QStringLiteral("Move %1 manually selected file(s) from %2 group(s) to the Recycle Bin?")
+                .arg(toDelete.size()).arg(affectedGroups),
+            QMessageBox::Yes|QMessageBox::Cancel,this);
+        QString detail=QStringLiteral(
+            "Only files you explicitly checkmarked will be deleted. Selections made in groups you previously viewed are included.");
+        if (emptiedGroups>0)
+            detail+=QStringLiteral(" Warning: this removes every remaining file from %1 group(s).")
+                .arg(emptiedGroups);
+        confirm.setInformativeText(detail);
+        confirm.setDefaultButton(QMessageBox::Cancel);
+        if (confirm.exec()!=QMessageBox::Yes) return;
+
+        startBulkDelete(std::move(toDelete),affectedGroups,QString(),false);
+    }
+
     void deleteAllMd5Duplicates() {
         if (busy_.load()) return;
         if (currentAlgorithm() != HashAlgo::MD5) {
@@ -1691,7 +1756,7 @@ private:
         confirm.setInformativeText(QStringLiteral("%1. Exactly one file will remain in every group.").arg(ruleLabel));
         confirm.setDefaultButton(QMessageBox::Cancel);
         if (confirm.exec()!=QMessageBox::Yes) return;
-        startBulkDelete(std::move(toDelete),eligibleGroups,ruleLabel);
+        startBulkDelete(std::move(toDelete),eligibleGroups,ruleLabel,true);
     }
 
     int chooseMd5Keeper(const std::vector<int>& candidates, Md5KeepRule rule) const {
@@ -1755,7 +1820,8 @@ private:
         }
     }
 
-    void startBulkDelete(QStringList toDelete, int groupCount, const QString& ruleLabel) {
+    void startBulkDelete(QStringList toDelete, int groupCount, const QString& ruleLabel,
+                         bool automaticMd5) {
         clearThumbs();
         QCoreApplication::processEvents();
         busy_=true;
@@ -1765,22 +1831,26 @@ private:
         prog_->setVisible(true);
         prog_->setRange(0,toDelete.size());
         prog_->setValue(0);
-        statusTxt_->setText(QStringLiteral("Deleting exact duplicates… 0 / %1").arg(toDelete.size()));
+        const QString progressLabel=automaticMd5
+            ? QStringLiteral("Deleting exact duplicates")
+            : QStringLiteral("Deleting selected files");
+        statusTxt_->setText(QStringLiteral("%1… 0 / %2").arg(progressLabel).arg(toDelete.size()));
 
         QPointer<DupeGemMainWindow> self(this);
-        auto post=[self,total=toDelete.size()](int done) {
+        auto post=[self,total=toDelete.size(),progressLabel](int done) {
             if (!self) return;
-            QMetaObject::invokeMethod(self,[self,done,total]{
+            QMetaObject::invokeMethod(self,[self,done,total,progressLabel]{
                 if (!self || !self->bulkDeleting_.load()) return;
                 self->prog_->setValue(done);
-                self->statusTxt_->setText(QStringLiteral("Deleting exact duplicates… %1 / %2").arg(done).arg(total));
+                self->statusTxt_->setText(QStringLiteral("%1… %2 / %3")
+                    .arg(progressLabel).arg(done).arg(total));
             },Qt::QueuedConnection);
         };
 
         auto* watcher=new QFutureWatcher<BulkDeleteResult>(this);
         bulkDeleteWatcher_=watcher;
         connect(watcher,&QFutureWatcher<BulkDeleteResult>::finished,this,
-                [this,watcher,groupCount,ruleLabel]{
+                [this,watcher,groupCount,ruleLabel,automaticMd5]{
             BulkDeleteResult result=watcher->future().takeResult();
             watcher->deleteLater(); bulkDeleteWatcher_=nullptr; bulkDeleting_=false;
             forgetDeletedFiles(result.deleted);
@@ -1797,8 +1867,11 @@ private:
             }
 
             if (!result.deleted.isEmpty()) {
-                statusTxt_->setText(QStringLiteral("Deleted %1 files from %2 groups using ‘%3’. Regrouping…")
-                    .arg(result.deleted.size()).arg(groupCount).arg(ruleLabel));
+                statusTxt_->setText(automaticMd5
+                    ? QStringLiteral("Deleted %1 files from %2 groups using ‘%3’. Regrouping…")
+                        .arg(result.deleted.size()).arg(groupCount).arg(ruleLabel)
+                    : QStringLiteral("Deleted %1 selected files from %2 groups. Regrouping…")
+                        .arg(result.deleted.size()).arg(groupCount));
                 refreshAfterDelete();
             } else {
                 setInteractive(true);
@@ -1974,11 +2047,17 @@ private:
         int selected=0;
         if (currentGroup_>=0 && currentGroup_<int(groups_.size()))
             for (int idx:groups_[size_t(currentGroup_)]) if (idx<int(images_.size())&&images_[size_t(idx)].selected) ++selected;
-        if (selectionLabel_) selectionLabel_->setText(QStringLiteral("%1 selected").arg(selected));
+        int totalSelected=0;
+        for (const ImgMeta& image:images_)
+            if (image.selected && !image.file.isEmpty()) ++totalSelected;
+        if (selectionLabel_) selectionLabel_->setText(QStringLiteral("%1 here • %2 total")
+            .arg(selected).arg(totalSelected));
     }
 
     void setInteractive(bool e) {
-        for (QPushButton* b : {btnSelect_, btnRegroup_, btnDelete_, btnDeleteAllGroups_}) if (b) b->setEnabled(e);
+        for (QPushButton* b : {btnSelect_, btnRegroup_, btnDelete_,
+                               btnDeleteSelectedAllGroups_,btnDeleteAllGroups_})
+            if (b) b->setEnabled(e);
 
         QList<QWidget*> widgets = {
             groupsList_, sortCombo_, groupFilter_,
@@ -2225,6 +2304,7 @@ private:
     QProgressBar* prog_{};
     QPushButton*  btnCancel_{};
     QPushButton*  btnDelete_{};
+    QPushButton*  btnDeleteSelectedAllGroups_{};
     QPushButton*  btnDeleteAllGroups_{};
     QLineEdit*    search_{};
     QLineEdit*    groupFilter_{};
@@ -2261,7 +2341,7 @@ int main(int argc, char *argv[]) {
     QImageReader::setAllocationLimit(std::clamp(imageLimitMb, 32, 4096));
     QApplication app(argc, argv);
     QCoreApplication::setApplicationName(QStringLiteral("DupeGem"));
-    QCoreApplication::setApplicationVersion(QStringLiteral("0.3.3"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("0.3.5"));
     dg::DupeGemMainWindow w;
     w.show();
     if (argc>1) {

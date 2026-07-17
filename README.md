@@ -127,11 +127,17 @@ Similarity groups use representative matching: every member must match the
 group's first image at the selected threshold. This prevents long chains of
 indirectly similar images from collapsing into one misleading group.
 
-Exact MD5 mode includes a **Delete From All Groups** action for keeping one file
-from every byte-identical group and moving the rest to the Windows Recycle Bin.
-The keeper can be selected by newest or oldest modified time, filename order,
-or shortest/longest filename. Bulk deletion runs in the background and can be
-cancelled between files.
+Every algorithm provides both **Delete Selected From Group** and **Delete
+Selected From All Groups**. Manual checkmarks persist while you move between
+groups, and the selection counter shows the current-group and library-wide
+totals. Cross-group deletion confirms the number of selected files and warns
+when every remaining file in a group is selected.
+
+Exact MD5 also includes **Auto Select/Delete From All Groups** for keeping one
+file from every byte-identical group and moving the rest to the Windows Recycle
+Bin. The keeper can be selected by newest or oldest modified time, filename
+order, or shortest/longest filename. Bulk deletion runs in the background and
+can be cancelled between files.
 
 The default decoder pool is capped at eight threads to prevent large or unusual
 images from multiplying peak memory usage. Override it when benchmarking a fast
