@@ -10,6 +10,8 @@ collections while keeping the interface responsive.
 
 ## Download
 
+[DOWNLOAD HERE](https://github.com/roper120nzt/DupeGem/releases/latest)
+
 The self-contained Windows build is available from
 [GitHub Releases](https://github.com/roper120nzt/DupeGem/releases/latest). Extract
 `DupeGem-portable.zip` and run `DupeGem.exe`; Qt and MSYS2 do not need to be
