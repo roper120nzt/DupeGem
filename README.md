@@ -1,7 +1,8 @@
 # DupeGem
 
-DupeGem is a Qt 6 / C++17 duplicate-image finder for Windows. It supports five
+DupeGem is a duplicate-image finder for Windows. It supports five
 perceptual hashes for visually similar images and MD5 for byte-identical files.
+It is the fastest perceptually similar image matching tool on windows.
 
 DupeGem was originally started because many duplicate-image finders are paid,
 too slow for large libraries, or unable to handle collections of 50,000+ images.
