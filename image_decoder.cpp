@@ -105,6 +105,24 @@ QSemaphore& jpeg2000DecodeSlot() {
     return slot;
 }
 
+QSemaphore& largeRasterDecodeSlot() {
+    // PNG decoding generally cannot be scaled by the image plugin before the
+    // full raster is allocated. With the higher per-image allocation limit,
+    // serialize unusually large PNG/APNG files so eight decoder workers cannot
+    // multiply a 500+ MB allocation into avoidable memory pressure.
+    static QSemaphore slot(1);
+    return slot;
+}
+
+bool needsLargeRasterSlot(const QString& path, const QSize& source) {
+    const QString suffix = suffixOf(path);
+    if (suffix != QStringLiteral("png") && suffix != QStringLiteral("apng")) return false;
+    if (!source.isValid()) return false;
+    constexpr qint64 formerLimitBytes = 128LL * 1024LL * 1024LL;
+    const qint64 estimatedBytes = qint64(source.width()) * qint64(source.height()) * 4LL;
+    return estimatedBytes > formerLimitBytes;
+}
+
 class SemaphoreGuard {
 public:
     explicit SemaphoreGuard(QSemaphore* semaphore) : semaphore_(semaphore) {
@@ -524,6 +542,8 @@ QImage decodeImage(const QString& path, const QSize& target, Qt::AspectRatioMode
     const bool transposed = reader.transformation() & QImageIOHandler::TransformationRotate90;
     if (transposed)
         source.transpose();
+    SemaphoreGuard largeRasterGuard(needsLargeRasterSlot(path, source)
+                                        ? &largeRasterDecodeSlot() : nullptr);
     QSize wanted;
     if (source.isValid()) wanted = requestedSize(source, target, mode);
     // QImageReader scales before applying EXIF rotation, so swap the decoder

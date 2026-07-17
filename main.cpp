@@ -2357,11 +2357,11 @@ int main(int argc, char *argv[]) {
     qInstallMessageHandler(dg::qtMessageHandler);
     bool imageLimitOk=false;
     int imageLimitMb=qEnvironmentVariableIntValue("DUPEGEM_IMAGE_LIMIT_MB", &imageLimitOk);
-    if (!imageLimitOk || imageLimitMb<32) imageLimitMb=128;
+    if (!imageLimitOk || imageLimitMb<32) imageLimitMb=1536;
     QImageReader::setAllocationLimit(std::clamp(imageLimitMb, 32, 4096));
     QApplication app(argc, argv);
     QCoreApplication::setApplicationName(QStringLiteral("DupeGem"));
-    QCoreApplication::setApplicationVersion(QStringLiteral("0.4.7"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("0.4.8"));
     dg::DupeGemMainWindow w;
     w.show();
     if (argc>1) {

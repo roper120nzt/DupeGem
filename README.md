@@ -171,12 +171,13 @@ SSD and a machine with ample memory:
 $env:DUPEGEM_THREADS = 12
 ```
 
-Qt image allocations are limited to 128 MB per decoded image as a final guard
-against corrupt or extreme files. This normally does not affect scanning because
-decoders are asked for a 64×64 result. It can be adjusted when necessary:
+Qt image allocations are limited to 1,536 MB per decoded image so very large PNGs
+can still be scanned. PNGs whose estimated decoded raster exceeds 128 MB are
+automatically decoded one at a time to prevent the worker pool from multiplying
+large allocations. The limit can still be adjusted when necessary:
 
 ```powershell
-$env:DUPEGEM_IMAGE_LIMIT_MB = 256
+$env:DUPEGEM_IMAGE_LIMIT_MB = 2048
 ```
 
 The cache is safe to delete whenever you want a completely fresh scan; DupeGem
