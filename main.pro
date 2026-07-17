@@ -1,5 +1,5 @@
 QT += widgets concurrent sql
-VERSION = 0.4.5
+VERSION = 0.4.6
 SOURCES += main.cpp image_decoder.cpp
 HEADERS += bk_tree.h image_decoder.h
 CONFIG += c++17

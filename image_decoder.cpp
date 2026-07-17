@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <string>
@@ -36,8 +37,8 @@ namespace dg {
 namespace {
 
 const QStringList& heifExtensions() {
-    static const QStringList extensions{QStringLiteral("heic"), QStringLiteral("heif"),
-                                        QStringLiteral("hif")};
+    static const QStringList extensions{QStringLiteral("avif"), QStringLiteral("heic"),
+                                        QStringLiteral("heif"), QStringLiteral("hif")};
     return extensions;
 }
 
@@ -59,6 +60,13 @@ const QStringList& rawExtensions() {
         QStringLiteral("raf"), QStringLiteral("raw"), QStringLiteral("rw2"),
         QStringLiteral("rwl"), QStringLiteral("rwz"), QStringLiteral("sr2"),
         QStringLiteral("srf"), QStringLiteral("srw"), QStringLiteral("x3f")};
+    return extensions;
+}
+
+const QStringList& jpeg2000Extensions() {
+    static const QStringList extensions{
+        QStringLiteral("j2c"), QStringLiteral("j2k"), QStringLiteral("jp2"),
+        QStringLiteral("jpc"), QStringLiteral("jpf"), QStringLiteral("jpx")};
     return extensions;
 }
 
@@ -87,6 +95,27 @@ QString suffixOf(const QString& path) {
 bool isHeif(const QString& path) { return heifExtensions().contains(suffixOf(path)); }
 bool isRaw(const QString& path) { return rawExtensions().contains(suffixOf(path)); }
 bool isVideo(const QString& path) { return videoExtensions().contains(suffixOf(path)); }
+bool isJpeg2000(const QString& path) { return jpeg2000Extensions().contains(suffixOf(path)); }
+
+QSemaphore& jpeg2000DecodeSlot() {
+    // The MSYS2 Qt JPEG 2000 plugin uses Jasper, whose process-global
+    // initialization is not safe when multiple QImageReaders enter it at once.
+    // Serialize this uncommon format only; all other decoders remain parallel.
+    static QSemaphore slot(1);
+    return slot;
+}
+
+class SemaphoreGuard {
+public:
+    explicit SemaphoreGuard(QSemaphore* semaphore) : semaphore_(semaphore) {
+        if (semaphore_) semaphore_->acquire();
+    }
+    ~SemaphoreGuard() { if (semaphore_) semaphore_->release(); }
+    SemaphoreGuard(const SemaphoreGuard&) = delete;
+    SemaphoreGuard& operator=(const SemaphoreGuard&) = delete;
+private:
+    QSemaphore* semaphore_{};
+};
 
 QSize orientedSize(QSize size, int flip) {
     if (flip == 5 || flip == 6) size.transpose();
@@ -448,6 +477,22 @@ QStringList supportedImageExtensions() {
     QStringList extensions;
     for (const QByteArray& format : QImageReader::supportedImageFormats())
         extensions << QString::fromLatin1(format).toLower();
+
+    // QImageReader advertises each handler's primary keys, but several common
+    // filename aliases use the same underlying formats. Include those aliases
+    // only when their decoder is actually present so enumeration and decoding
+    // always stay in sync.
+    const auto addAliases = [&extensions](const QString& decoder,
+                                          std::initializer_list<const char*> aliases) {
+        if (!extensions.contains(decoder, Qt::CaseInsensitive)) return;
+        for (const char* alias : aliases) extensions << QString::fromLatin1(alias);
+    };
+    addAliases(QStringLiteral("bmp"),  {"dib"});
+    addAliases(QStringLiteral("jpeg"), {"jif", "jpe"});
+    addAliases(QStringLiteral("jpg"),  {"jif", "jpe"});
+    addAliases(QStringLiteral("png"),  {"apng"});
+    addAliases(QStringLiteral("jp2"),  {"j2c", "j2k", "jpc", "jpf", "jpx"});
+
     extensions << heifExtensions() << rawExtensions();
     extensions.removeDuplicates();
     std::sort(extensions.begin(), extensions.end(), [](const QString& left, const QString& right) {
@@ -467,6 +512,7 @@ QImage decodeImage(const QString& path, const QSize& target, Qt::AspectRatioMode
     if (isHeif(path)) return decodeHeif(path, target, mode, sourceSize, true);
     if (isRaw(path)) return decodeRaw(path, target, mode, sourceSize, true);
 
+    SemaphoreGuard jpeg2000Guard(isJpeg2000(path) ? &jpeg2000DecodeSlot() : nullptr);
     QImageReader reader(path);
     reader.setAutoTransform(true);
     if (!reader.canRead()) return {};
@@ -474,25 +520,46 @@ QImage decodeImage(const QString& path, const QSize& target, Qt::AspectRatioMode
     const bool transposed = reader.transformation() & QImageIOHandler::TransformationRotate90;
     if (transposed)
         source.transpose();
-    if (sourceSize) *sourceSize = source;
-    QSize wanted = requestedSize(source, target, mode);
+    QSize wanted;
+    if (source.isValid()) wanted = requestedSize(source, target, mode);
     // QImageReader scales before applying EXIF rotation, so swap the decoder
     // request for 90/270-degree images to obtain the intended final size.
     if (transposed) wanted.transpose();
-    if (wanted.isValid()) reader.setScaledSize(wanted);
-    return reader.read();
+    const bool decoderCanScale = wanted.isValid()
+        && reader.supportsOption(QImageIOHandler::ScaledSize);
+    if (decoderCanScale) reader.setScaledSize(wanted);
+
+    QImage image = reader.read();
+    if (image.isNull() && decoderCanScale) {
+        // Some third-party plugins advertise ScaledSize but fail particular
+        // files when it is requested. Retry the original decode, then use
+        // Qt's scaler, rather than showing a false "Preview unavailable".
+        QImageReader retry(path);
+        retry.setAutoTransform(true);
+        image = retry.read();
+    }
+    if (sourceSize) *sourceSize = source.isValid() ? source : image.size();
+    return finishScale(std::move(image), target, mode);
 }
 
 QSize imageSourceSize(const QString& path) {
     QSize source;
     if (isHeif(path)) { decodeHeif(path, {}, Qt::IgnoreAspectRatio, &source, false); return source; }
     if (isRaw(path)) { decodeRaw(path, {}, Qt::IgnoreAspectRatio, &source, false); return source; }
+    SemaphoreGuard jpeg2000Guard(isJpeg2000(path) ? &jpeg2000DecodeSlot() : nullptr);
     QImageReader reader(path);
     reader.setAutoTransform(true);
     if (!reader.canRead()) return {};
     source = reader.size();
-    if (reader.transformation() & QImageIOHandler::TransformationRotate90)
-        source.transpose();
+    if (source.isValid()) {
+        if (reader.transformation() & QImageIOHandler::TransformationRotate90)
+            source.transpose();
+    } else {
+        // ICNS and a few JPEG 2000 variants may not expose Size without a
+        // decode. This path is used only when metadata was not captured during
+        // hashing, so fall back once and cache the result with the scan.
+        source = reader.read().size();
+    }
     return source;
 }
 

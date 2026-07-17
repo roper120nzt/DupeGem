@@ -26,13 +26,24 @@ DupeGem combines Qt's image readers with dedicated libheif and LibRaw decoders:
 | GIF | `.gif` |
 | Windows Icon | `.ico` |
 | JPEG / JFIF | `.jfif`, `.jpeg`, `.jpg` |
+| JPEG aliases | `.jif`, `.jpe` |
 | Portable Bitmap | `.pbm` |
 | Portable Graymap | `.pgm` |
-| PNG | `.png` |
+| PNG / Animated PNG | `.apng`, `.png` |
 | Portable Pixmap | `.ppm` |
 | X Bitmap | `.xbm` |
 | X Pixmap | `.xpm` |
+| WebP | `.webp` |
+| AVIF | `.avif` |
 | HEIC / HEIF | `.heic`, `.heif`, `.hif` |
+| TIFF | `.tif`, `.tiff` |
+| JPEG 2000 | `.j2c`, `.j2k`, `.jp2`, `.jpc`, `.jpf`, `.jpx` |
+| SVG / Compressed SVG | `.svg`, `.svgz` |
+| Truevision TGA | `.tga` |
+| Apple Icon Image | `.icns` |
+| Multiple-image Network Graphics | `.mng` |
+| Wireless Bitmap | `.wbmp` |
+| Device-independent Bitmap | `.dib` |
 | Adobe Digital Negative | `.dng` |
 | Canon RAW | `.cr2`, `.cr3`, `.crw` |
 | Nikon RAW | `.nef`, `.nrw` |
@@ -70,11 +81,11 @@ availability depends on the codecs and thumbnail handlers installed in Windows.
 
 ## Build prerequisites
 
-Install Qt 6, libheif, and thread-safe LibRaw in the same MSYS2 MinGW64
-environment used by `qmake6`:
+Install Qt 6, the additional Qt image and SVG plugins, libheif, and thread-safe
+LibRaw in the same MSYS2 MinGW64 environment used by `qmake6`:
 
 ```bash
-pacman -S --needed mingw-w64-x86_64-qt6-base mingw-w64-x86_64-libheif mingw-w64-x86_64-libraw
+pacman -S --needed mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-imageformats mingw-w64-x86_64-qt6-svg mingw-w64-x86_64-libheif mingw-w64-x86_64-libraw
 ```
 
 The existing Notepad++ build command remains unchanged. Run `qmake6 main.pro`
