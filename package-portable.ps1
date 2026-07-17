@@ -42,6 +42,24 @@ Write-Host 'Deploying Qt runtime and plugins...'
 & $Deploy.Source --release --no-translations --no-system-d3d-compiler --no-opengl-sw --dir $OutDir $OutExe
 if($LASTEXITCODE -ne 0){ throw "windeployqt6 failed with exit code $LASTEXITCODE." }
 
+# These plugins are part of DupeGem's documented image support. Fail the
+# release build instead of silently publishing a portable ZIP without them.
+$RequiredImagePlugins = @(
+    'qicns.dll', 'qjp2.dll', 'qmng.dll', 'qsvg.dll', 'qtga.dll',
+    'qtiff.dll', 'qwbmp.dll', 'qwebp.dll'
+)
+$ImageFormats = Join-Path $OutDir 'imageformats'
+foreach($Plugin in $RequiredImagePlugins){
+    $PluginPath = Join-Path $ImageFormats $Plugin
+    if(-not (Test-Path -LiteralPath $PluginPath -PathType Leaf)){
+        throw "Required image plugin was not deployed: $Plugin. Install mingw-w64-x86_64-qt6-imageformats and mingw-w64-x86_64-qt6-svg."
+    }
+}
+$SvgRuntime = Join-Path $OutDir 'Qt6Svg.dll'
+if(-not (Test-Path -LiteralPath $SvgRuntime -PathType Leaf)){
+    throw 'Required SVG runtime was not deployed: Qt6Svg.dll.'
+}
+
 # DupeGem uses SQLite only. windeployqt deploys every installed SQL backend,
 # which pulls in unrelated Firebird, MariaDB, PostgreSQL, and ODBC runtimes.
 $SqlDrivers = Join-Path $OutDir 'sqldrivers'
