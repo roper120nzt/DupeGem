@@ -5,7 +5,7 @@ perceptual hashes for visually similar images and MD5 for byte-identical files.
 
 DupeGem was originally started because many duplicate-image finders are paid,
 too slow for large libraries, or unable to handle collections of 50,000+ images.
-It was built to be free, fast, fully local, and capable of scanning huge image
+It was built to be free, fast af, fully local, and capable of scanning huge image
 collections while keeping the interface responsive.
 
 ## Download
@@ -14,6 +14,16 @@ The self-contained Windows build is available from
 [GitHub Releases](https://github.com/roper120nzt/DupeGem/releases/latest). Extract
 `DupeGem-portable.zip` and run `DupeGem.exe`; Qt and MSYS2 do not need to be
 installed on the destination computer.
+
+## Benchmarks
+
+| Tool | Time | Throughput | Peak memory | Relative time |
+|---|---:|---:|---:|---:|
+| **DupeGem 0.4.7** | **7m 40s** | **85.90 images/s** | **1,005 MiB** | **1.00×** |
+| Czkawka 12.0.0 | 12m 21s | 50.56 images/s | 1,162 MiB | 1.61× slower |
+| imagededup 0.3.3.post2 | 18m 22s | 36.00 images/s | 5,160 MiB | 2.40× slower |
+| photodedupe 1.0.7 | 24m 42s | 26.75 images/s | 1,145 MiB | 3.22× slower |
+
 
 ## Supported image formats
 
