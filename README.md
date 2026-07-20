@@ -24,11 +24,11 @@ Given a 39,668 image dataset
 
 | Tool and version       | Method                         |      Time | Relative time | Successfully processed | Images/sec |     Peak memory |
 | ---------------------- | ------------------------------ | --------: | ------------: | ---------------------: | ---------: | --------------: |
-| **DupeGem 0.4.8**      | 256-bit dHash, distance 4      | **9m37s** |     **1.00×** |             **39,668** |  **68.71** | **1,505.7 MiB** |
-| Czkawka CLI 12.0.0     | 256-bit Gradient, distance 4   |    12m21s |         1.28× |                 37,454 |      50.56 |     1,162.4 MiB |
-| imagededup 0.3.3.post2 | 64-bit dHash, distance 4       |    18m22s |         1.91× |                 39,664 |      36.00 |     5,160.0 MiB |
-| photodedupe 1.0.7      | Colour-difference matcher      |    24m42s |         2.57× |                 39,652 |      26.75 |     1,145.2 MiB |
-| dupeGuru 4.3.1         | 15×15 colour blocks, 98% match |    72m27s |         7.53× |                 39,649 |       9.12 |     1,413.5 MiB |
+| **DupeGem 0.4.9**      | 256-bit dHash, distance 4      | **8m28s** |     **1.00×** |             **39,668** |  **78.08** | **1,560.2. MiB** |
+| Czkawka CLI 12.0.0     | 256-bit Gradient, distance 4   |    12m21s |        1.46× |                 37,454 |      50.56 |     1,162.4 MiB |
+| imagededup 0.3.3.post2 | 64-bit dHash, distance 4       |    18m22s |        2.17× |                 39,664 |      36.00 |     5,160.0 MiB |
+| photodedupe 1.0.7      | Colour-difference matcher      |    24m42s |        2.92× |                 39,652 |      26.75 |     1,145.2 MiB |
+| dupeGuru 4.3.1         | 15×15 colour blocks, 98% match |    72m27s |        8.56× |                 39,649 |       9.12 |     1,413.5 MiB |
 
 
 
