@@ -12,4 +12,5 @@
 !bk_tree.h
 !copy-deps.ps1
 !package-portable.ps1
+!benchmark-thread-counts.ps1
 !icon.png

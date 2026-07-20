@@ -31,7 +31,6 @@ Given a 39,668 image dataset
 | dupeGuru 4.3.1         | 15×15 colour blocks, 98% match |    72m27s |        8.56× |                 39,649 |       9.12 |     1,413.5 MiB |
 
 
-
 ## Supported image formats
 
 DupeGem combines Qt's image readers with dedicated libheif and LibRaw decoders:

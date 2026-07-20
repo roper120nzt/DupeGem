@@ -13,6 +13,7 @@
 #include <QDebug>
 #include <QDir>
 #include <QDirIterator>
+#include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
 #include <QFileDialog>
@@ -108,6 +109,18 @@ inline const char* algoName(HashAlgo a) {
         case HashAlgo::BHash: return "BlockMean Hash (bHash)";
         case HashAlgo::MD5:   return "Exact MD5 (byte-identical)";
         default: return "Unknown";
+    }
+}
+
+inline const char* shortAlgoName(HashAlgo a) {
+    switch (a) {
+        case HashAlgo::DHash: return "dHash";
+        case HashAlgo::PHash: return "pHash";
+        case HashAlgo::AHash: return "aHash";
+        case HashAlgo::WHash: return "wHash";
+        case HashAlgo::BHash: return "bHash";
+        case HashAlgo::MD5:   return "MD5";
+        default: return "unknown";
     }
 }
 
@@ -406,12 +419,13 @@ private:
 };
 
 inline int workerCount() {
-    int threads=QThread::idealThreadCount();
-    if (threads<1) threads=4;
-    threads=std::clamp(threads,1,8);
     bool ok=false;
     const int requested=qEnvironmentVariableIntValue("DUPEGEM_THREADS", &ok);
-    return ok && requested>0 ? std::clamp(requested,1,64) : threads;
+    if (ok && requested>0) return std::clamp(requested,1,64);
+    // Qt reports the logical CPUs this process can actually use (including any
+    // affinity limit).  A small 25% oversubscription helps hide decode/I/O waits.
+    const int effectiveCpuCount=std::max(1,QThread::idealThreadCount());
+    return std::clamp((effectiveCpuCount*5+3)/4,1,64); // ceil(1.25 x CPUs)
 }
 
 inline bool readAndHash(ImgMeta& m, HashAlgo algo) {
@@ -959,10 +973,15 @@ public:
             prog_->setVisible(false);
             prog_->setMaximum(0); // indeterminate when shown w/out max
             prog_->setTextVisible(true);
+            hashRateTxt_ = new QLabel;
+            hashRateTxt_->setObjectName(QStringLiteral("mutedLabel"));
+            hashRateTxt_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            hashRateTxt_->setMinimumWidth(82);
+            hashRateTxt_->setVisible(false);
             btnCancel_=new QPushButton(QStringLiteral("Cancel"));
             btnCancel_->setObjectName(QStringLiteral("quietButton"));
             btnCancel_->setVisible(false);
-            row->addWidget(statusTxt_, 1); row->addWidget(btnCancel_); row->addWidget(prog_, 1);
+            row->addWidget(statusTxt_, 1); row->addWidget(prog_, 1); row->addWidget(hashRateTxt_); row->addWidget(btnCancel_);
             ctl->addLayout(row);
         }
 
@@ -1236,6 +1255,29 @@ protected:
 
 private:
     // === Core flow ===
+    void resetHashRate() {
+        hashRateTimer_.invalidate();
+        if (hashRateTxt_) hashRateTxt_->setVisible(false);
+    }
+
+    void updateHashRate(int done) {
+        if (!hashRateTxt_ || done<=0 || !hashRateTimer_.isValid()) return;
+        const qint64 elapsedMs=hashRateTimer_.elapsed();
+        if (elapsedMs<=0) return;
+        const double averageRate=done*1000.0/double(elapsedMs);
+        hashRateTxt_->setText(QStringLiteral("%1 img/s").arg(averageRate,0,'f',1));
+        hashRateTxt_->setVisible(true);
+    }
+
+    void updateHashRateForProgress(const QString& text, int value) {
+        const bool visualHashing=text.startsWith(QStringLiteral("Hashing "));
+        if (visualHashing) updateHashRate(value);
+        else if (text.startsWith(QStringLiteral("Building similarity index"))
+                 || text.startsWith(QStringLiteral("Forming representative"))
+                 || text.startsWith(QStringLiteral("Grouping...")))
+            resetHashRate();
+    }
+
     void selectFolder() {
         if (busy_.load()) return;
         const QString dir = QFileDialog::getExistingDirectory(this, QStringLiteral("Select Folder"));
@@ -1254,6 +1296,8 @@ private:
         images_.clear(); groups_.clear(); trees_.clear(); groupsList_->clear(); groupIdxSorted_.clear();
         setInteractive(false);
         prog_->setRange(0,0); prog_->setVisible(true);
+        resetHashRate();
+        hashRateTimer_.start();
         statusTxt_->setText(QStringLiteral("Enumerating files..."));
 
         const auto algo=currentAlgorithm();
@@ -1283,6 +1327,7 @@ private:
             QMetaObject::invokeMethod(self,[self,text,value,maximum]{
                 if (!self) return;
                 self->statusTxt_->setText(text);
+                self->updateHashRateForProgress(text,value);
                 if (maximum>=0) { self->prog_->setRange(0,maximum); self->prog_->setValue(value); }
                 else self->prog_->setRange(0,0);
             },Qt::QueuedConnection);
@@ -1293,6 +1338,7 @@ private:
         connect(watcher,&QFutureWatcher<ScanResult>::finished,this,[this,watcher,algo]{
             ScanResult result=watcher->future().takeResult();
             watcher->deleteLater(); scanWatcher_=nullptr; scanning_=false;
+            resetHashRate();
             if (result.cancelled || cancelled_) {
                 busy_=false; prog_->setVisible(false); setInteractive(true);
                 statusTxt_->setText(QStringLiteral("Scan cancelled.")); return;
@@ -1376,7 +1422,7 @@ private:
                             }
                             const int d=++done;
                             if ((d&63)==0 || d==int(pending.size()))
-                                post(QStringLiteral("Hashing %1 • %2 / %3").arg(QString::fromLatin1(algoName(algo))).arg(d).arg(pending.size()),d,int(pending.size()));
+                                post(QStringLiteral("Hashing (%1) • %2 / %3").arg(QString::fromLatin1(shortAlgoName(algo))).arg(d).arg(pending.size()),d,int(pending.size()));
                         }));
                     }
                     pool.waitForDone();
@@ -1416,6 +1462,8 @@ private:
         clearThumbs(); groupsList_->clear(); groupIdxSorted_.clear();
         currentGroup_=-1; cancelled_=false; setInteractive(false);
         prog_->setVisible(true); prog_->setRange(0,0);
+        resetHashRate();
+        hashRateTimer_.start();
         const int threshold=thrSlider_->value();
         const bool showSingles=showSingles_->isChecked();
         const QString root=currentDir_, cachePath=cacheFile_;
@@ -1428,6 +1476,7 @@ private:
             QMetaObject::invokeMethod(self,[self,text,value,maximum]{
                 if (!self) return;
                 self->statusTxt_->setText(text);
+                self->updateHashRateForProgress(text,value);
                 if (maximum>=0) { self->prog_->setRange(0,maximum); self->prog_->setValue(value); }
                 else self->prog_->setRange(0,0);
             },Qt::QueuedConnection);
@@ -1437,6 +1486,7 @@ private:
         connect(watcher,&QFutureWatcher<GroupResult>::finished,this,[this,watcher]{
             GroupResult result=watcher->future().takeResult();
             watcher->deleteLater(); groupWatcher_=nullptr;
+            resetHashRate();
             images_=std::move(result.images);
             if (result.cancelled || cancelled_) {
                 busy_=false; prog_->setVisible(false); setInteractive(true); statusTxt_->setText(QStringLiteral("Operation cancelled.")); return;
@@ -1527,7 +1577,7 @@ private:
                                         out.images[size_t(idx)].valid=readAndHash(out.images[size_t(idx)],algo);
                                         completed[pos-base]=1;
                                     }
-                                    const int d=++done; if ((d&63)==0 || d==int(pending.size())) post(QStringLiteral("Lazy hashing • %1 / %2").arg(d).arg(pending.size()),d,int(pending.size()));
+                                    const int d=++done; if ((d&63)==0 || d==int(pending.size())) post(QStringLiteral("Hashing (%1) • %2 / %3").arg(QString::fromLatin1(shortAlgoName(algo))).arg(d).arg(pending.size()),d,int(pending.size()));
                                 }));
                             }
                             pool.waitForDone();
@@ -2321,6 +2371,7 @@ private:
     QPushButton* btnRegroup_{};
     QCheckBox*   showSingles_{};
     QLabel*      statusTxt_{};
+    QLabel*      hashRateTxt_{};
     QProgressBar* prog_{};
     QPushButton*  btnCancel_{};
     QPushButton*  btnDelete_{};
@@ -2338,6 +2389,7 @@ private:
     // Thumbs
     QTimer* addTimer_{};
     QTimer* filterTimer_{};
+    QElapsedTimer hashRateTimer_;
     QTimer* searchTimer_{};
     std::vector<QPointer<ThumbWidget>> currentThumbs_;
     std::vector<int> pendingThumbIndices_;
